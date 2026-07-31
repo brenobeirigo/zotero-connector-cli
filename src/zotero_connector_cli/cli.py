@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+
+from pypdf import PdfReader
 
 from . import __version__
 from .privileged import (
@@ -285,6 +288,124 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
+def _identity_tokens(value: str) -> list[str]:
+    stopwords = {
+        "about",
+        "after",
+        "approach",
+        "based",
+        "from",
+        "into",
+        "model",
+        "study",
+        "their",
+        "using",
+        "with",
+    }
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) >= 4 and token not in stopwords
+    ]
+
+
+def _validate_pdf_identity(path: Path, title: str, doi: str) -> dict:
+    try:
+        with path.open("rb") as stream:
+            signature = stream.read(5)
+        if signature != b"%PDF-":
+            return {"ok": False, "reason": "invalid PDF signature"}
+
+        reader = PdfReader(path, strict=False)
+        page_text = "\n".join(
+            (page.extract_text() or "") for page in reader.pages[:3]
+        )
+        metadata_title = ""
+        if reader.metadata:
+            metadata_title = str(reader.metadata.title or "")
+        identity_text = f"{metadata_title}\n{page_text}".casefold()
+    except Exception as exc:
+        return {"ok": False, "reason": f"unreadable PDF: {exc}"}
+
+    title_tokens = _identity_tokens(title)
+    matched_tokens = [token for token in title_tokens if token in identity_text]
+    required_matches = (
+        len(title_tokens)
+        if len(title_tokens) <= 3
+        else max(3, (len(title_tokens) * 3 + 4) // 5)
+    )
+    title_match = bool(title_tokens) and len(matched_tokens) >= required_matches
+
+    clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi.strip().casefold())
+    doi_compact = re.sub(r"[^a-z0-9]+", "", clean_doi)
+    text_compact = re.sub(r"[^a-z0-9]+", "", identity_text)
+    doi_match = bool(doi_compact) and doi_compact in text_compact
+
+    return {
+        "ok": doi_match or title_match,
+        "reason": "identity matched" if doi_match or title_match else "title/DOI mismatch",
+        "pages": len(reader.pages),
+        "doiMatch": doi_match,
+        "titleMatch": title_match,
+        "titleTokensMatched": matched_tokens,
+        "titleTokensRequired": required_matches,
+        "metadataTitle": metadata_title,
+    }
+
+
+def _download_snapshot(directory: Path) -> dict[Path, tuple[int, int]]:
+    snapshot = {}
+    for path in directory.glob("*.pdf"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.is_file():
+            snapshot[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
+    return snapshot
+
+
+def _wait_for_verified_download(
+    directory: Path,
+    baseline: dict[Path, tuple[int, int]],
+    title: str,
+    doi: str,
+    timeout: float,
+    poll_seconds: float = 1.0,
+) -> tuple[Path | None, dict | None, list[dict]]:
+    deadline = time.monotonic() + timeout
+    stable_observations: dict[Path, tuple[int, int]] = {}
+    rejected: dict[Path, dict] = {}
+    while time.monotonic() < deadline:
+        candidates = []
+        for path in directory.glob("*.pdf"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path.is_file():
+                candidates.append((stat.st_mtime_ns, stat.st_size, path))
+        for modified_ns, size, path in sorted(candidates):
+            resolved = path.resolve()
+            current = (modified_ns, size)
+            if baseline.get(resolved) == current or current[1] <= 0:
+                continue
+            previous_size, observations = stable_observations.get(resolved, (-1, 0))
+            observations = observations + 1 if previous_size == current[1] else 1
+            stable_observations[resolved] = (current[1], observations)
+            if observations < 2:
+                continue
+            validation = _validate_pdf_identity(path, title=title, doi=doi)
+            if validation["ok"]:
+                return resolved, validation, list(rejected.values())
+            rejected[resolved] = {
+                "path": str(resolved),
+                "validation": validation,
+            }
+        time.sleep(poll_seconds)
+    return None, None, list(rejected.values())
+
+
 def _timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -433,8 +554,17 @@ def _interactive_block_reason(title: str) -> str | None:
 def _batch_retrieval_attempt(
     parent_key: str,
     url: str,
+    row: dict,
     args: argparse.Namespace,
 ) -> tuple[int, dict]:
+    if args.interactive_downloads:
+        return _interactive_download_attempt(
+            parent_key=parent_key,
+            url=url,
+            title=row.get(args.title_column, "").strip(),
+            doi=row.get(args.doi_column, "").strip(),
+            args=args,
+        )
     if url:
         save_args = argparse.Namespace(
             parent_key=parent_key,
@@ -460,6 +590,136 @@ def _batch_retrieval_attempt(
     return 4, result
 
 
+def _interactive_download_attempt(
+    parent_key: str,
+    url: str,
+    title: str,
+    doi: str,
+    args: argparse.Namespace,
+) -> tuple[int, dict]:
+    if not url:
+        return 4, {
+            "ok": False,
+            "route": "manual-no-url",
+            "parentKey": parent_key,
+        }
+    if not title:
+        return 5, {
+            "ok": False,
+            "route": "invalid-row",
+            "parentKey": parent_key,
+            "error": f"missing {args.title_column}",
+        }
+
+    if not args.skip_native:
+        native = find_available_pdf(parent_key, wait_seconds=args.native_wait)
+        if native["ok"]:
+            native["sync"] = sync_library()
+            return 0, native
+
+    download_dir = (
+        Path(args.download_dir).expanduser().resolve()
+        if args.download_dir
+        else Path.home() / "Downloads"
+    )
+    if not download_dir.is_dir():
+        return 5, {
+            "ok": False,
+            "route": "download-directory-error",
+            "parentKey": parent_key,
+            "error": f"download directory does not exist: {download_dir}",
+        }
+
+    baseline = _download_snapshot(download_dir)
+    browser = _choose_browser(args.browser)
+    temporary_window = None
+    close_error = None
+    result = None
+    exit_code = 9
+    try:
+        temporary_window = _open_url(browser, url)
+        time.sleep(args.load_wait)
+        window = next(
+            (
+                candidate
+                for candidate in list_windows()
+                if candidate.hwnd == temporary_window.hwnd
+            ),
+            temporary_window,
+        )
+        activate_window(window)
+        print(
+            f"DOWNLOAD REQUIRED {parent_key}: {title}\n"
+            f"Use the open {browser.title()} window to complete login/challenge "
+            "and download the exact PDF. The batch is watching "
+            f"{download_dir} for {args.interactive_wait:g} seconds.",
+            file=sys.stderr,
+            flush=True,
+        )
+        downloaded, validation, rejected = _wait_for_verified_download(
+            download_dir,
+            baseline=baseline,
+            title=title,
+            doi=doi,
+            timeout=args.interactive_wait,
+        )
+        if downloaded:
+            attachment = attach_pdf_file(
+                parent_key,
+                str(downloaded),
+                wait_seconds=args.native_wait,
+            )
+            if attachment["ok"]:
+                attachment["sync"] = sync_library()
+                result = {
+                    "ok": True,
+                    "route": "interactive-download-attach",
+                    "parentKey": parent_key,
+                    "browser": browser,
+                    "windowTitle": window.title,
+                    "downloaded": str(downloaded),
+                    "validation": validation,
+                    "rejectedDownloads": rejected,
+                    "attachment": attachment,
+                }
+                exit_code = 0
+            else:
+                result = {
+                    "ok": False,
+                    "route": "interactive-attach-error",
+                    "parentKey": parent_key,
+                    "downloaded": str(downloaded),
+                    "validation": validation,
+                    "rejectedDownloads": rejected,
+                    "attachment": attachment,
+                }
+                exit_code = 5
+        else:
+            result = {
+                "ok": False,
+                "route": "interactive-download-timeout",
+                "interactiveRequired": True,
+                "parentKey": parent_key,
+                "browser": browser,
+                "windowTitle": window.title,
+                "url": url,
+                "rejectedDownloads": rejected,
+            }
+    finally:
+        if temporary_window:
+            try:
+                _close_temporary_browser_window(temporary_window)
+            except (RuntimeError, OSError) as exc:
+                close_error = str(exc)
+
+    result["browserWindowClosed"] = not close_error
+    result["cleanupOk"] = not close_error
+    if close_error:
+        result["tabCloseError"] = close_error
+        return 8, result
+    return exit_code, result
+
+
 def command_batch_csv(args: argparse.Namespace) -> int:
     csv_path = Path(args.csv).expanduser().resolve()
     if not csv_path.is_file():
@@ -473,6 +733,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
         args.timeout,
         args.settle,
         args.native_wait,
+        args.interactive_wait,
     ) < 0:
         raise RuntimeError("batch timing options must be zero or greater")
     report_path = (
@@ -505,6 +766,16 @@ def command_batch_csv(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 f"CSV has no {args.status_column!r} column required by --update-csv"
             )
+        if args.interactive_downloads and args.title_column not in fieldnames:
+            raise RuntimeError(
+                f"CSV has no {args.title_column!r} column required by "
+                "--interactive-downloads"
+            )
+        if args.policy_value and args.policy_column not in fieldnames:
+            raise RuntimeError(
+                f"CSV has no {args.policy_column!r} column required by "
+                "--policy-value"
+            )
 
         selected = [
             row
@@ -512,6 +783,12 @@ def command_batch_csv(args: argparse.Namespace) -> int:
             if not args.status_value
             or row.get(args.status_column, "") == args.status_value
         ]
+        if args.policy_value:
+            selected = [
+                row
+                for row in selected
+                if row.get(args.policy_column, "") == args.policy_value
+            ]
         results = []
         started_at = _timestamp()
 
@@ -526,11 +803,16 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 "runId": run_id,
                 "startedAt": started_at,
                 "updatedAt": _timestamp(),
-                "executionMode": "single-process-serial",
+                "executionMode": (
+                    "single-process-serial-interactive-download"
+                    if args.interactive_downloads
+                    else "single-process-serial"
+                ),
                 "csv": str(csv_path),
                 "reportFile": str(report_path),
                 "logFile": str(log_path),
                 "selected": len(selected),
+                "policyValue": args.policy_value or None,
                 "processed": len(results),
                 "withPDF": sum(result["ok"] for result in results),
                 "withoutPDF": sum(
@@ -538,7 +820,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                     for result in results
                 ),
                 "interactiveRequired": sum(
-                    result.get("route") == "interactive-required"
+                    bool(result.get("interactiveRequired"))
                     for result in results
                 ),
                 "operationalErrors": operational_errors,
@@ -595,6 +877,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                     exit_code, child_result = _batch_retrieval_attempt(
                         parent_key,
                         url,
+                        row,
                         args,
                     )
                     attempts.append(
@@ -1039,6 +1322,12 @@ def build_parser() -> argparse.ArgumentParser:
     batch_csv.add_argument("--status-column", default="status")
     batch_csv.add_argument("--status-value", default="missing_pdf")
     batch_csv.add_argument("--success-status", default="in_zotero")
+    batch_csv.add_argument("--policy-column", default="retrieval_policy")
+    batch_csv.add_argument(
+        "--policy-value",
+        default="",
+        help="optionally select only rows with this retrieval-policy value",
+    )
     batch_csv.add_argument("--update-csv", action="store_true")
     batch_csv.add_argument(
         "--reconcile-only",
@@ -1053,6 +1342,26 @@ def build_parser() -> argparse.ArgumentParser:
     batch_csv.add_argument("--timeout", type=float, default=100.0)
     batch_csv.add_argument("--settle", type=float, default=10.0)
     batch_csv.add_argument("--native-wait", type=float, default=8.0)
+    batch_csv.add_argument(
+        "--interactive-downloads",
+        action="store_true",
+        help=(
+            "open each row for a human download, verify the resulting PDF, "
+            "and attach it without model monitoring"
+        ),
+    )
+    batch_csv.add_argument(
+        "--download-dir",
+        help="browser download directory (default: the current user's Downloads)",
+    )
+    batch_csv.add_argument(
+        "--interactive-wait",
+        type=float,
+        default=600.0,
+        help="seconds to wait per row for a verified PDF download",
+    )
+    batch_csv.add_argument("--title-column", default="title")
+    batch_csv.add_argument("--doi-column", default="doi")
     batch_csv.add_argument(
         "--report-file",
         help="durable atomic JSON checkpoint (default: beside the CSV)",

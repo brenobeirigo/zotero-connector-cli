@@ -126,6 +126,33 @@ isolated windows are closed before the batch continues, and the final report's
 `interactiveRequired` count tells an agent when Breno needs a later login
 handoff.
 
+For that handoff, process the whole review queue with no model monitoring:
+
+```powershell
+zotero-connector batch-csv `
+  --csv "C:\path\to\pdf-status.csv" `
+  --status-value manual_review `
+  --policy-value interactive_download `
+  --interactive-downloads `
+  --browser edge `
+  --update-csv `
+  --interactive-wait 900
+```
+
+The script serially opens each row's URL and watches the browser download
+folder while the user completes login/challenge and clicks the publisher's
+actual download control. A completed file is attached only after its PDF
+signature and DOI/title identity pass. The exact temporary window closes before
+the next row. The final report uses
+`single-process-serial-interactive-download`; mismatches remain unmodified and
+are listed under `rejectedDownloads`. Use `--download-dir` if the browser saves
+elsewhere.
+
+The optional `retrieval_policy` column separates feasible download handoffs
+(`interactive_download`) from records that still need an edition, licensing,
+or format choice (`manual_decision`). `--policy-value` filters the whole queue
+before the serial run; `--policy-column` changes the column name when needed.
+
 The default report and JSONL log are written beside the CSV. Override them with
 `--report-file` and `--log-file`. Exit codes are:
 

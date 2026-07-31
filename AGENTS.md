@@ -95,8 +95,46 @@ The runner writes these files beside the source CSV by default:
 - `<stem>.zotero-connector-report.json` — atomic latest-run checkpoint.
 - `<stem>.zotero-connector-runs.jsonl` — append-only event history.
 
-The JSON report declares `executionMode: single-process-serial`. Treat any
-other value as an incompatible or older runner.
+The standard JSON report declares `executionMode: single-process-serial`.
+Interactive-download mode uses the explicitly documented variant below; treat
+any other value as an incompatible or older runner.
+
+### Manual-review download handoff
+
+When publisher metadata is correct but Connector cannot obtain the file, run
+the complete manual-review queue once in interactive-download mode:
+
+```powershell
+zotero-connector batch-csv `
+  --csv "<project-output>\pdf-status.csv" `
+  --status-value manual_review `
+  --policy-value interactive_download `
+  --interactive-downloads `
+  --browser edge `
+  --update-csv `
+  --interactive-wait 900
+```
+
+This remains a single-process serial batch. For each row with an `access_url`,
+the script opens one isolated window and waits while Breno completes any
+login/challenge and uses the publisher's real download control. It watches the
+browser download directory, accepts only a stable `%PDF-` file whose DOI or
+title matches the CSV row, attaches it to the canonical Zotero parent, updates
+the checksum/status checkpoint, closes the exact window, and advances. Invalid
+or mismatched downloads are reported and preserved for review, never attached
+or deleted. Rows without an access URL are classified `manual-no-url`.
+
+Use a `retrieval_policy` column to keep licensing or edition decisions out of
+the browser loop. The command above selects only `interactive_download`; use
+`manual_decision` for books, previews, ambiguous editions, or sources where a
+single canonical PDF has not been chosen. Override the column name with
+`--policy-column` only when the project schema requires it.
+
+Use `--download-dir` when the browser does not download to the current user's
+`Downloads` folder. The report declares
+`executionMode: single-process-serial-interactive-download`. The user may
+interact with publisher pages; the model must not poll, click, or run rows
+individually.
 
 After an interruption, reconcile Zotero state without reopening any pages:
 

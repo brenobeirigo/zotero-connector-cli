@@ -11,14 +11,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from pypdf import PdfWriter
+
 from zotero_connector_cli.cli import (
     _batch_retrieval_attempt,
     _child_failed_operationally,
     _child_route,
     _close_temporary_browser_window,
     _interactive_block_reason,
+    _interactive_download_attempt,
     _open_url,
     _single_batch_instance,
+    _validate_pdf_identity,
+    _wait_for_verified_download,
     _write_csv_atomic,
     _write_json_atomic,
     build_parser,
@@ -93,6 +98,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.retries, 2)
         self.assertIsNone(args.report_file)
         self.assertIsNone(args.log_file)
+        self.assertFalse(args.interactive_downloads)
+        self.assertEqual(args.interactive_wait, 600.0)
+        self.assertEqual(args.policy_column, "retrieval_policy")
+        self.assertEqual(args.policy_value, "")
 
     def test_batch_rejects_model_driven_limit_loop(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -120,6 +129,53 @@ class CliTests(unittest.TestCase):
             self.assertEqual(report_data["processed"], 1)
             with status.open("r", encoding="utf-8", newline="") as stream:
                 self.assertEqual(next(csv.DictReader(stream))["status"], "in_zotero")
+
+    def test_pdf_identity_validation_uses_metadata_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "download.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=72, height=72)
+            writer.add_metadata(
+                {"/Title": "A survey of linear cost multicommodity network flows"}
+            )
+            with path.open("wb") as stream:
+                writer.write(stream)
+            result = _validate_pdf_identity(
+                path,
+                title="A survey of linear cost multicommodity network flows",
+                doi="10.1287/opre.26.2.209",
+            )
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["titleMatch"])
+
+    @patch("zotero_connector_cli.cli.time.sleep")
+    @patch(
+        "zotero_connector_cli.cli.time.monotonic",
+        side_effect=[0.0, 0.1, 0.2],
+    )
+    def test_download_watcher_returns_only_verified_pdf(
+        self,
+        _monotonic: Mock,
+        _sleep: Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "article.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=72, height=72)
+            writer.add_metadata({"/Title": "Robust optimization"})
+            with path.open("wb") as stream:
+                writer.write(stream)
+            downloaded, validation, rejected = _wait_for_verified_download(
+                root,
+                baseline={},
+                title="Robust optimization",
+                doi="",
+                timeout=10,
+            )
+            self.assertEqual(downloaded, path.resolve())
+            self.assertTrue(validation["ok"])
+            self.assertEqual(rejected, [])
 
     def test_batch_lock_rejects_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -216,6 +272,7 @@ class CliTests(unittest.TestCase):
     def test_batch_attempt_uses_internal_serial_save(self, execute: Mock) -> None:
         execute.return_value = (3, {"ok": False, "route": "connector-no-changes"})
         args = SimpleNamespace(
+            interactive_downloads=False,
             browser="edge",
             load_wait=0,
             timeout=1,
@@ -224,12 +281,66 @@ class CliTests(unittest.TestCase):
             native_wait=0,
         )
         code, _result = _batch_retrieval_attempt(
-            "ABCD1234", "https://example.com/article", args
+            "ABCD1234",
+            "https://example.com/article",
+            {"title": "A paper", "doi": ""},
+            args,
         )
         self.assertEqual(code, 3)
         save_args = execute.call_args.args[0]
         self.assertFalse(save_args.keep_tab)
         self.assertNotIn("subprocess.run", inspect.getsource(command_batch_csv))
+
+    def test_interactive_download_without_url_is_classified(self) -> None:
+        code, result = _interactive_download_attempt(
+            parent_key="ABCD1234",
+            url="",
+            title="A paper",
+            doi="",
+            args=SimpleNamespace(),
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(result["route"], "manual-no-url")
+
+    def test_interactive_download_attaches_verified_file_serially(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            downloaded = Path(directory) / "article.pdf"
+            window = Window(2, 11, r"C:\Edge\msedge.exe", "Article")
+            args = SimpleNamespace(
+                skip_native=True,
+                download_dir=directory,
+                browser="edge",
+                load_wait=0,
+                interactive_wait=10,
+                native_wait=0,
+            )
+            with (
+                redirect_stderr(io.StringIO()),
+                patch("zotero_connector_cli.cli._open_url", return_value=window),
+                patch("zotero_connector_cli.cli.list_windows", return_value=[window]),
+                patch("zotero_connector_cli.cli.activate_window"),
+                patch(
+                    "zotero_connector_cli.cli._wait_for_verified_download",
+                    return_value=(downloaded, {"ok": True}, []),
+                ),
+                patch(
+                    "zotero_connector_cli.cli.attach_pdf_file",
+                    return_value={"ok": True, "route": "attach-file"},
+                ) as attach,
+                patch("zotero_connector_cli.cli.sync_library", return_value={"ok": True}),
+                patch("zotero_connector_cli.cli._close_temporary_browser_window") as close,
+            ):
+                code, result = _interactive_download_attempt(
+                    parent_key="ABCD1234",
+                    url="https://example.com/article",
+                    title="A paper",
+                    doi="10.1/example",
+                    args=args,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(result["route"], "interactive-download-attach")
+            attach.assert_called_once_with("ABCD1234", str(downloaded), wait_seconds=0)
+            close.assert_called_once_with(window)
 
     def test_browser_candidates_have_expected_executable_names(self) -> None:
         self.assertTrue(

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Breno Alves Beirigo" }]
-dependencies = []
+dependencies = ["pypdf>=5,<7"]
 
 [project.scripts]
 zotero-connector = "zotero_connector_cli.cli:main"
