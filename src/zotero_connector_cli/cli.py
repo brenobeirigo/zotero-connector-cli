@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import ctypes
+import hashlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__
@@ -203,6 +211,492 @@ def command_attach_file(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0 if result["ok"] else 5
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def _timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
+
+
+def _write_csv_atomic(path: Path, rows: list[dict]) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=rows[0].keys(),
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
+
+
+def _append_json_line(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+@contextmanager
+def _single_batch_instance(csv_path: Path):
+    """Hold a crash-safe, machine-local named mutex for one project CSV."""
+    if sys.platform != "win32":
+        yield
+        return
+
+    mutex_name = (
+        "Local\\ZoteroConnectorCLI-"
+        + hashlib.sha256(str(csv_path).casefold().encode("utf-8")).hexdigest()
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    if not handle:
+        raise RuntimeError(
+            f"Unable to create the batch lock (Windows error {ctypes.get_last_error()})"
+        )
+    if ctypes.get_last_error() == 183:
+        kernel32.CloseHandle(handle)
+        raise RuntimeError(f"Another batch is already running for {csv_path}")
+    try:
+        yield
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _final_parent_state(parent_key: str, retries: int, retry_delay: float) -> dict:
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            return parent_info(parent_key)
+        except (ZoteroUnavailable, ZoteroBridgeError) as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(retry_delay)
+    raise RuntimeError(
+        f"Unable to read final Zotero state for {parent_key}: {last_error}"
+    )
+
+
+def _child_failed_operationally(
+    child_result: dict,
+    attempts: list[dict],
+    reconcile_only: bool,
+) -> bool:
+    if reconcile_only:
+        return False
+    if child_result.get("route") in {"command-error", "command-timeout"}:
+        return True
+    return bool(attempts and attempts[-1]["exitCode"] not in (0, 3, 4))
+
+
+def command_batch_csv(args: argparse.Namespace) -> int:
+    csv_path = Path(args.csv).expanduser().resolve()
+    if not csv_path.is_file():
+        raise RuntimeError(f"CSV file not found: {csv_path}")
+    if args.retries < 0 or args.limit < 0:
+        raise RuntimeError("--retries and --limit must be zero or greater")
+    if min(
+        args.retry_delay,
+        args.pause,
+        args.load_wait,
+        args.timeout,
+        args.settle,
+        args.native_wait,
+    ) < 0:
+        raise RuntimeError("batch timing options must be zero or greater")
+    report_path = (
+        Path(args.report_file).expanduser().resolve()
+        if args.report_file
+        else csv_path.with_name(f"{csv_path.stem}.zotero-connector-report.json")
+    )
+    log_path = (
+        Path(args.log_file).expanduser().resolve()
+        if args.log_file
+        else csv_path.with_name(f"{csv_path.stem}.zotero-connector-runs.jsonl")
+    )
+    run_id = (
+        f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-"
+        f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    )
+
+    with _single_batch_instance(csv_path):
+        ping()
+        bridge_ping()
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+        if not rows:
+            raise RuntimeError(f"CSV has no records: {csv_path}")
+        if args.key_column not in fieldnames:
+            raise RuntimeError(f"CSV has no {args.key_column!r} column")
+        if args.update_csv and args.status_column not in fieldnames:
+            raise RuntimeError(
+                f"CSV has no {args.status_column!r} column required by --update-csv"
+            )
+
+        selected = [
+            row
+            for row in rows
+            if not args.status_value
+            or row.get(args.status_column, "") == args.status_value
+        ]
+        if args.limit:
+            selected = selected[: args.limit]
+        results = []
+        started_at = _timestamp()
+
+        def checkpoint(finished: bool = False) -> dict:
+            operational_errors = sum(
+                bool(result.get("operationalError")) for result in results
+            )
+            report = {
+                "ok": all(result["ok"] for result in results)
+                and not operational_errors,
+                "finished": finished,
+                "runId": run_id,
+                "startedAt": started_at,
+                "updatedAt": _timestamp(),
+                "csv": str(csv_path),
+                "reportFile": str(report_path),
+                "logFile": str(log_path),
+                "selected": len(selected),
+                "processed": len(results),
+                "withPDF": sum(result["ok"] for result in results),
+                "withoutPDF": sum(
+                    not result["ok"] and not result.get("operationalError")
+                    for result in results
+                ),
+                "operationalErrors": operational_errors,
+                "results": results,
+            }
+            _write_json_atomic(report_path, report)
+            return report
+
+        _append_json_line(
+            log_path,
+            {
+                "event": "run-start",
+                "runId": run_id,
+                "at": started_at,
+                "csv": str(csv_path),
+                "selected": len(selected),
+            },
+        )
+        checkpoint()
+
+        for index, row in enumerate(selected, start=1):
+            parent_key = row.get(args.key_column, "").strip()
+            url = row.get(args.url_column, "").strip()
+            if not parent_key:
+                result = {
+                    "index": index,
+                    "ok": False,
+                    "route": "invalid-row",
+                    "error": f"missing {args.key_column}",
+                    "operationalError": True,
+                    "attachments": [],
+                    "collections": [],
+                    "attempts": [],
+                }
+                results.append(result)
+                _append_json_line(
+                    log_path,
+                    {"event": "item", "runId": run_id, "at": _timestamp(), **result},
+                )
+                checkpoint()
+                continue
+
+            child_result = {
+                "ok": False,
+                "route": "reconcile-only" if args.reconcile_only else "not-run",
+                "parentKey": parent_key,
+            }
+            attempts = []
+            max_attempts = 1 if args.reconcile_only else args.retries + 1
+            for attempt in range(1, max_attempts + 1):
+                if args.reconcile_only:
+                    break
+                if url:
+                    command = [
+                        sys.executable,
+                        "-m",
+                        "zotero_connector_cli",
+                        "save",
+                        "--parent-key",
+                        parent_key,
+                        "--browser",
+                        args.browser,
+                        "--url",
+                        url,
+                        "--load-wait",
+                        str(args.load_wait),
+                        "--timeout",
+                        str(args.timeout),
+                        "--settle",
+                        str(args.settle),
+                        "--native-wait",
+                        str(args.native_wait),
+                        "--json",
+                    ]
+                    if args.skip_native:
+                        command.append("--skip-native")
+                elif not args.skip_native:
+                    command = [
+                        sys.executable,
+                        "-m",
+                        "zotero_connector_cli",
+                        "find-pdf",
+                        "--parent-key",
+                        parent_key,
+                        "--wait",
+                        str(args.native_wait),
+                        "--json",
+                    ]
+                else:
+                    child_result = {
+                        "ok": False,
+                        "route": "no-url",
+                        "parentKey": parent_key,
+                    }
+                    break
+
+                try:
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=args.timeout + args.load_wait + 180,
+                        check=False,
+                    )
+                    try:
+                        child_result = json.loads(completed.stdout)
+                    except json.JSONDecodeError:
+                        child_result = {
+                            "ok": False,
+                            "route": "command-error",
+                            "error": (completed.stderr or completed.stdout).strip(),
+                        }
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "exitCode": completed.returncode,
+                            "result": child_result,
+                        }
+                    )
+                    if completed.returncode in (0, 3, 4):
+                        break
+                except subprocess.TimeoutExpired as exc:
+                    child_result = {
+                        "ok": False,
+                        "route": "command-timeout",
+                        "error": f"child command exceeded {exc.timeout} seconds",
+                    }
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "exitCode": None,
+                            "result": child_result,
+                        }
+                    )
+                except OSError as exc:
+                    child_result = {
+                        "ok": False,
+                        "route": "command-error",
+                        "error": str(exc),
+                    }
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "exitCode": None,
+                            "result": child_result,
+                        }
+                    )
+                if attempt < max_attempts:
+                    time.sleep(args.retry_delay)
+
+            try:
+                final = _final_parent_state(
+                    parent_key,
+                    retries=args.retries,
+                    retry_delay=args.retry_delay,
+                )
+            except RuntimeError as exc:
+                result = {
+                    "index": index,
+                    "ok": False,
+                    "parentKey": parent_key,
+                    "title": row.get("title", ""),
+                    "route": "final-state-error",
+                    "error": str(exc),
+                    "operationalError": True,
+                    "attachments": [],
+                    "collections": [],
+                    "attempts": attempts,
+                }
+                results.append(result)
+                _append_json_line(
+                    log_path,
+                    {"event": "item", "runId": run_id, "at": _timestamp(), **result},
+                )
+                checkpoint()
+                continue
+
+            final_pdfs = [
+                attachment
+                for attachment in final["attachments"]
+                if attachment["isPDF"]
+                and not attachment["deleted"]
+                and attachment["exists"]
+            ]
+            result = {
+                "index": index,
+                "ok": bool(final_pdfs),
+                "parentKey": parent_key,
+                "title": final["title"],
+                "route": (
+                    "final-state-pdf" if final_pdfs else child_result.get("route")
+                ),
+                "attachments": final_pdfs,
+                "collections": final["collections"],
+                "attempts": attempts,
+            }
+            if (
+                not final_pdfs
+                and _child_failed_operationally(
+                    child_result,
+                    attempts,
+                    reconcile_only=args.reconcile_only,
+                )
+            ):
+                result["operationalError"] = True
+                result["error"] = child_result.get(
+                    "error", "child command failed before a conclusive result"
+                )
+
+            if final_pdfs and args.update_csv:
+                attachment = final_pdfs[0]
+                path = Path(attachment["path"])
+                try:
+                    sha256 = _file_sha256(path)
+                except OSError as exc:
+                    result["ok"] = False
+                    result["route"] = "attachment-read-error"
+                    result["error"] = str(exc)
+                    result["operationalError"] = True
+                else:
+                    if args.status_column in row:
+                        row[args.status_column] = args.success_status
+                    if "local_pdf" in row:
+                        row["local_pdf"] = str(path)
+                    if "sha256" in row:
+                        row["sha256"] = sha256
+                    _write_csv_atomic(csv_path, rows)
+
+            results.append(result)
+            _append_json_line(
+                log_path,
+                {"event": "item", "runId": run_id, "at": _timestamp(), **result},
+            )
+            checkpoint()
+            if args.pause and index < len(selected):
+                time.sleep(args.pause)
+
+        report = checkpoint(finished=True)
+        _append_json_line(
+            log_path,
+            {
+                "event": "run-finish",
+                "runId": run_id,
+                "at": _timestamp(),
+                "processed": report["processed"],
+                "withPDF": report["withPDF"],
+                "withoutPDF": report["withoutPDF"],
+                "operationalErrors": report["operationalErrors"],
+            },
+        )
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Processed {report['processed']} items: "
+            f"{report['withPDF']} with PDFs, "
+            f"{report['withoutPDF']} without PDFs, "
+            f"{report['operationalErrors']} operational errors."
+        )
+        print(f"Report: {report_path}")
+        print(f"Run log: {log_path}")
+        for result in results:
+            if result.get("operationalError"):
+                state_label = "ERROR"
+            else:
+                state_label = "PDF" if result["ok"] else "NO PDF"
+            collections = ", ".join(
+                collection["name"] for collection in result["collections"]
+            )
+            print(
+                f"- {state_label} {result.get('parentKey', '(missing key)')}: "
+                f"{result.get('title', '')} [{collections or 'no collection'}]"
+            )
+    if report["operationalErrors"]:
+        return 7
+    return 0 if report["withoutPDF"] == 0 else 6
 
 
 def _run_save(args: argparse.Namespace, open_url: bool) -> int:
@@ -454,6 +948,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attach_file.add_argument("--json", action="store_true", help="emit JSON")
     attach_file.set_defaults(func=command_attach_file)
+
+    batch_csv = subparsers.add_parser(
+        "batch-csv",
+        help="process Zotero parent keys and access URLs from a CSV without a model",
+    )
+    batch_csv.add_argument("--csv", required=True, help="input CSV path")
+    batch_csv.add_argument("--browser", choices=list(BROWSER_PROCESSES), default="edge")
+    batch_csv.add_argument("--key-column", default="zotero_key")
+    batch_csv.add_argument("--url-column", default="access_url")
+    batch_csv.add_argument("--status-column", default="status")
+    batch_csv.add_argument("--status-value", default="missing_pdf")
+    batch_csv.add_argument("--success-status", default="in_zotero")
+    batch_csv.add_argument("--update-csv", action="store_true")
+    batch_csv.add_argument(
+        "--reconcile-only",
+        action="store_true",
+        help="skip retrieval and update/report from current Zotero state",
+    )
+    batch_csv.add_argument("--skip-native", action="store_true")
+    batch_csv.add_argument("--retries", type=int, default=2)
+    batch_csv.add_argument("--retry-delay", type=float, default=5.0)
+    batch_csv.add_argument("--pause", type=float, default=2.0)
+    batch_csv.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="process at most this many selected rows; 0 means no limit",
+    )
+    batch_csv.add_argument("--load-wait", type=float, default=12.0)
+    batch_csv.add_argument("--timeout", type=float, default=100.0)
+    batch_csv.add_argument("--settle", type=float, default=10.0)
+    batch_csv.add_argument("--native-wait", type=float, default=8.0)
+    batch_csv.add_argument(
+        "--report-file",
+        help="durable atomic JSON checkpoint (default: beside the CSV)",
+    )
+    batch_csv.add_argument(
+        "--log-file",
+        help="append-only JSONL run log (default: beside the CSV)",
+    )
+    batch_csv.add_argument("--json", action="store_true")
+    batch_csv.set_defaults(func=command_batch_csv)
 
     save = subparsers.add_parser("save", help="open a URL and invoke Save to Zotero")
     _add_save_options(save, include_url=True)

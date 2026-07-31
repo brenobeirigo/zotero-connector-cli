@@ -228,8 +228,10 @@ if (!parent) throw new Error("Canonical parent item not found: " + {parent});
 if (parent.deleted) throw new Error("Canonical parent item is in Zotero Trash");
 if (!parent.isRegularItem()) throw new Error("Canonical parent is not a regular item");
 
-const cleanDOI = item => Zotero.Utilities.cleanDOI(
-    item.getField("DOI") || item.getExtraField("DOI") || ""
+const cleanDOI = item => (
+    Zotero.Utilities.cleanDOI(
+        item.getField("DOI") || item.getExtraField("DOI") || ""
+    ) || ""
 ).toLowerCase();
 const normalizeTitle = value => value
     .normalize("NFKD")
@@ -249,17 +251,16 @@ const originalCollectionIDs = [...parent.getCollections()].sort((a, b) => a - b)
 const currentPDFs = parent.getAttachments()
     .map(id => Zotero.Items.get(id))
     .filter(attachment => attachment.isPDFAttachment() && !attachment.deleted);
-if (currentPDFs.length) {{
-    throw new Error("Canonical parent already has a PDF attachment");
-}}
 
 const candidateKeys = {candidates};
+const regularCandidates = [];
 const matches = [];
 for (const key of candidateKeys) {{
     const candidate = Zotero.Items.getByLibraryAndKey(parent.libraryID, key);
     if (!candidate || candidate.deleted || !candidate.isRegularItem() || candidate.id === parent.id) {{
         continue;
     }}
+    regularCandidates.push(candidate);
     const candidateDOI = cleanDOI(candidate);
     const doiMatch = parentDOI && candidateDOI && parentDOI === candidateDOI;
     const titleMatch = parentTitle
@@ -272,8 +273,8 @@ for (const key of candidateKeys) {{
     matches.push({{candidate, pdfs, doiMatch, titleMatch}});
 }}
 
-if (matches.length === 0 && candidateKeys.length === 1) {{
-    const mismatch = Zotero.Items.getByLibraryAndKey(parent.libraryID, candidateKeys[0]);
+if (matches.length === 0 && regularCandidates.length === 1) {{
+    const mismatch = regularCandidates[0];
     if (mismatch && !mismatch.deleted && mismatch.isRegularItem() && mismatch.id !== parent.id) {{
         await Zotero.DB.executeTransaction(async () => {{
             mismatch.deleted = true;
@@ -316,6 +317,63 @@ if (matches.length === 0 && candidateKeys.length === 1) {{
             }}
         }};
     }}
+}}
+
+if (currentPDFs.length) {{
+    if (matches.length === 0) {{
+        return {{
+            ok: true,
+            route: "already-present",
+            parentKey: parent.key,
+            attachmentKeys: currentPDFs.map(attachment => attachment.key)
+        }};
+    }}
+    if (matches.length !== 1) {{
+        throw new Error("Expected exactly one exact temporary duplicate; found " + matches.length);
+    }}
+    const redundant = matches[0].candidate;
+    for (const id of redundant.getAttachments(true)) {{
+        const child = Zotero.Items.get(id);
+        if (child.isFileAttachment() && child.getAnnotations().length) {{
+            throw new Error("Refusing to trash an annotated temporary duplicate");
+        }}
+    }}
+    await Zotero.DB.executeTransaction(async () => {{
+        redundant.deleted = true;
+        await redundant.save();
+    }});
+    const refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
+    const refreshedRedundant = Zotero.Items.getByLibraryAndKey(parent.libraryID, redundant.key);
+    const finalCollectionIDs = [...refreshedParent.getCollections()].sort((a, b) => a - b);
+    if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)) {{
+        throw new Error("Canonical parent collection memberships changed unexpectedly");
+    }}
+    const collections = finalCollectionIDs.map(id => {{
+        const collection = Zotero.Collections.get(id);
+        return {{key: collection.key, name: collection.name}};
+    }});
+    const temporaryChildrenLeftInTrash = [];
+    for (const id of refreshedRedundant.getAttachments(true)) {{
+        const child = Zotero.Items.get(id);
+        temporaryChildrenLeftInTrash.push({{
+            key: child.key,
+            title: child.getField("title"),
+            contentType: child.attachmentContentType,
+            linkMode: child.attachmentLinkMode,
+            deleted: child.deleted
+        }});
+    }}
+    return {{
+        ok: refreshedRedundant.deleted,
+        route: "connector-redundant",
+        parentKey: refreshedParent.key,
+        duplicateKey: refreshedRedundant.key,
+        duplicateTrashed: refreshedRedundant.deleted,
+        collections,
+        collectionMembershipsPreserved: true,
+        temporaryChildrenLeftInTrash,
+        attachmentKeys: currentPDFs.map(attachment => attachment.key)
+    }};
 }}
 
 if (matches.length !== 1) {{
@@ -386,8 +444,14 @@ await Zotero.DB.executeTransaction(async () => {{
 }});
 
 const refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
-const moved = Zotero.Items.getByLibraryAndKey(parent.libraryID, attachment.key);
 const refreshedDuplicate = Zotero.Items.getByLibraryAndKey(parent.libraryID, duplicate.key);
+const finalPDFs = refreshedParent.getAttachments()
+    .map(id => Zotero.Items.get(id))
+    .filter(current => current.isPDFAttachment() && !current.deleted);
+if (finalPDFs.length !== 1) {{
+    throw new Error("Expected exactly one final PDF on the canonical parent; found " + finalPDFs.length);
+}}
+const moved = finalPDFs[0];
 const finalCollectionIDs = [...refreshedParent.getCollections()].sort((a, b) => a - b);
 if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)) {{
     throw new Error("Canonical parent collection memberships changed unexpectedly");

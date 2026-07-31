@@ -65,6 +65,55 @@ zotero-connector attach-file `
   --file "C:\Users\breno\Downloads\EBSCO-FullText-07_31_2026.pdf"
 ```
 
+Run an entire project status CSV locally, with no model or API service:
+
+```powershell
+zotero-connector batch-csv `
+  --csv "C:\path\to\pdf-status.csv" `
+  --browser edge `
+  --update-csv
+```
+
+The batch command resumes from rows whose `status` is `missing_pdf`, retries
+transient Zotero errors twice, verifies final attachment state directly in
+Zotero, and can update `status`, `local_pdf`, and `sha256`. Each successful row
+is written through an atomic CSV checkpoint immediately, so a stopped run can
+resume without redoing completed items. The runner also:
+
+- prevents overlapping runs against the same CSV with a crash-safe Windows
+  named mutex;
+- isolates timeouts and transient failures to one row and continues;
+- writes an atomic `*.zotero-connector-report.json` checkpoint after every row;
+- appends every start, item result, and finish to
+  `*.zotero-connector-runs.jsonl`;
+- returns exit code `7` for operational errors and `6` for a clean run that
+  simply found no PDF for one or more selected items.
+
+This execution path is deterministic local software. It does not call an LLM,
+Codex, or any paid API. It still requires Zotero Desktop, the configured Zotero
+Connector, an interactive Windows desktop, and an already authenticated browser
+session. Login, MFA, CAPTCHA, and consent prompts require a human.
+
+After an interrupted run, use `--reconcile-only --update-csv` to refresh the
+CSV from final Zotero state without reopening publisher pages.
+
+For inexpensive routine operation, launch the command manually or from Windows
+Task Scheduler with **Run only when user is logged on**. The Connector shortcut
+needs an interactive desktop, so do not use a non-interactive service account.
+Use `--limit N` when a scheduled run should process only a bounded number of
+rows. Configure Task Scheduler not to start a second instance if one is already
+running; the CLI mutex independently enforces the same rule.
+
+The default report and JSONL log are written beside the CSV. Override them with
+`--report-file` and `--log-file`. Exit codes are:
+
+- `0`: every selected item has a PDF (or there was nothing left to process);
+- `6`: the run completed normally, but at least one selected item still lacks a
+  retrievable PDF;
+- `7`: at least one row had an operational failure and should be retried;
+- `2`: startup or configuration failed, such as Zotero or CLI Bridge being
+  unavailable.
+
 Use `--json` for machine-readable output. A successful command reports Zotero
 items changed after the shortcut was sent.
 
