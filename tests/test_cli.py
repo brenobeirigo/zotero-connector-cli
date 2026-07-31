@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import csv
 import inspect
+import io
 import json
 import tempfile
 import unittest
@@ -14,6 +16,7 @@ from zotero_connector_cli.cli import (
     _child_failed_operationally,
     _child_route,
     _close_temporary_browser_window,
+    _interactive_block_reason,
     _open_url,
     _single_batch_instance,
     _write_csv_atomic,
@@ -88,9 +91,20 @@ class CliTests(unittest.TestCase):
         self.assertTrue(args.update_csv)
         self.assertTrue(args.reconcile_only)
         self.assertEqual(args.retries, 2)
-        self.assertEqual(args.limit, 0)
         self.assertIsNone(args.report_file)
         self.assertIsNone(args.log_file)
+
+    def test_batch_rejects_model_driven_limit_loop(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "batch-csv",
+                    "--csv",
+                    r"C:\Downloads\pdf-status.csv",
+                    "--limit",
+                    "1",
+                ]
+            )
 
     def test_atomic_checkpoint_writers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -137,12 +151,30 @@ class CliTests(unittest.TestCase):
                 reconcile_only=True,
             )
         )
+        self.assertFalse(
+            _child_failed_operationally(
+                {"route": "interactive-required"},
+                [{"exitCode": 9}],
+                reconcile_only=False,
+            )
+        )
 
     def test_batch_promotes_nested_adoption_route(self) -> None:
         self.assertEqual(
             _child_route({"adoption": {"route": "connector-mismatch"}}),
             "connector-mismatch",
         )
+
+    def test_interactive_challenge_titles_are_detected(self) -> None:
+        self.assertEqual(
+            _interactive_block_reason("Just a moment... - Microsoft Edge"),
+            "anti-bot challenge",
+        )
+        self.assertEqual(
+            _interactive_block_reason("Sign in | Taylor & Francis"),
+            "sign-in page",
+        )
+        self.assertIsNone(_interactive_block_reason("Robust Optimization"))
 
     @patch("zotero_connector_cli.cli.foreground_window")
     @patch("zotero_connector_cli.cli.list_windows")

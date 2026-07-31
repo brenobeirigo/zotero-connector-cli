@@ -114,9 +114,17 @@ CSV from final Zotero state without reopening publisher pages.
 For inexpensive routine operation, launch the command manually or from Windows
 Task Scheduler with **Run only when user is logged on**. The Connector shortcut
 needs an interactive desktop, so do not use a non-interactive service account.
-Use `--limit N` when a scheduled run should process only a bounded number of
-rows. Configure Task Scheduler not to start a second instance if one is already
-running; the CLI mutex independently enforces the same rule.
+The production batch intentionally has no `--limit` option. Submit the complete
+CSV once; this prevents an agent from turning a project into repeated one-row
+model-driven invocations. For an explicit diagnostic, create a separate
+one-row CSV. Configure Task Scheduler not to start a second instance if one is
+already running; the CLI mutex independently enforces the same rule.
+
+Anti-bot (`Just a moment...`), human-verification, sign-in, login, access-denied,
+and similar interstitial titles are reported as `interactive-required`. Their
+isolated windows are closed before the batch continues, and the final report's
+`interactiveRequired` count tells an agent when Breno needs a later login
+handoff.
 
 The default report and JSONL log are written beside the CSV. Override them with
 `--report-file` and `--log-file`. Exit codes are:

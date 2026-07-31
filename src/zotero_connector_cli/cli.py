@@ -403,7 +403,7 @@ def _child_failed_operationally(
         return False
     if child_result.get("route") in {"command-error", "command-timeout"}:
         return True
-    return bool(attempts and attempts[-1]["exitCode"] not in (0, 3, 4))
+    return bool(attempts and attempts[-1]["exitCode"] not in (0, 3, 4, 9))
 
 
 def _child_route(child_result: dict) -> str:
@@ -411,6 +411,22 @@ def _child_route(child_result: dict) -> str:
         child_result.get("route")
         or child_result.get("adoption", {}).get("route")
         or "unknown"
+    )
+
+
+def _interactive_block_reason(title: str) -> str | None:
+    normalized = " ".join(title.casefold().split())
+    indicators = {
+        "just a moment": "anti-bot challenge",
+        "verify you are human": "human-verification challenge",
+        "checking your browser": "anti-bot challenge",
+        "access denied": "access-denied page",
+        "sign in": "sign-in page",
+        "log in": "login page",
+    }
+    return next(
+        (reason for marker, reason in indicators.items() if marker in normalized),
+        None,
     )
 
 
@@ -448,8 +464,8 @@ def command_batch_csv(args: argparse.Namespace) -> int:
     csv_path = Path(args.csv).expanduser().resolve()
     if not csv_path.is_file():
         raise RuntimeError(f"CSV file not found: {csv_path}")
-    if args.retries < 0 or args.limit < 0:
-        raise RuntimeError("--retries and --limit must be zero or greater")
+    if args.retries < 0:
+        raise RuntimeError("--retries must be zero or greater")
     if min(
         args.retry_delay,
         args.pause,
@@ -496,8 +512,6 @@ def command_batch_csv(args: argparse.Namespace) -> int:
             if not args.status_value
             or row.get(args.status_column, "") == args.status_value
         ]
-        if args.limit:
-            selected = selected[: args.limit]
         results = []
         started_at = _timestamp()
 
@@ -521,6 +535,10 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 "withPDF": sum(result["ok"] for result in results),
                 "withoutPDF": sum(
                     not result["ok"] and not result.get("operationalError")
+                    for result in results
+                ),
+                "interactiveRequired": sum(
+                    result.get("route") == "interactive-required"
                     for result in results
                 ),
                 "operationalErrors": operational_errors,
@@ -586,7 +604,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                             "result": child_result,
                         }
                     )
-                    if exit_code in (0, 3, 4, 8):
+                    if exit_code in (0, 3, 4, 8, 9):
                         break
                 except (RuntimeError, ZoteroUnavailable, ZoteroBridgeError) as exc:
                     child_result = {
@@ -706,6 +724,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 "processed": report["processed"],
                 "withPDF": report["withPDF"],
                 "withoutPDF": report["withoutPDF"],
+                "interactiveRequired": report["interactiveRequired"],
                 "operationalErrors": report["operationalErrors"],
             },
         )
@@ -724,6 +743,8 @@ def command_batch_csv(args: argparse.Namespace) -> int:
         for result in results:
             if result.get("operationalError"):
                 state_label = "ERROR"
+            elif result.get("route") == "interactive-required":
+                state_label = "LOGIN"
             else:
                 state_label = "PDF" if result["ok"] else "NO PDF"
             collections = ", ".join(
@@ -792,41 +813,56 @@ def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
                 BROWSER_PROCESSES[browser], title_contains=args.title_contains
             )
 
-        activate_window(window)
-        send_ctrl_shift_s()
-        after, changed = wait_for_changes(
-            before,
-            timeout=args.timeout,
-            settle_seconds=args.settle,
-        )
-        result = _result_payload(
-            browser=browser,
-            window_title=window.title,
-            before_version=before.version,
-            after_version=after.version,
-            changed=changed,
-        )
-        if not changed:
-            result["route"] = "connector-no-changes"
-        changed_parent_keys = [
-            item["key"]
-            for item in changed
-            if not item.get("data", {}).get("parentItem")
-            and item.get("data", {}).get("itemType") != "attachment"
-        ]
-        candidate_keys = list(
-            dict.fromkeys(
-                [
-                    *changed_parent_keys,
-                    *sorted(after.keys.difference(before.keys)),
-                ]
+        block_reason = _interactive_block_reason(window.title) if open_url else None
+        if block_reason:
+            result = {
+                "ok": False,
+                "route": "interactive-required",
+                "interactiveRequired": True,
+                "reason": block_reason,
+                "browser": browser,
+                "windowTitle": window.title,
+                "parentKey": args.parent_key,
+                "url": args.url,
+            }
+        else:
+            activate_window(window)
+            send_ctrl_shift_s()
+            after, changed = wait_for_changes(
+                before,
+                timeout=args.timeout,
+                settle_seconds=args.settle,
             )
-        )
-        if changed:
-            result["adoption"] = adopt_connector_pdf(args.parent_key, candidate_keys)
-            result["ok"] = bool(result["adoption"]["ok"])
-            if result["ok"] or result["adoption"].get("duplicateTrashed"):
-                result["sync"] = sync_library()
+            result = _result_payload(
+                browser=browser,
+                window_title=window.title,
+                before_version=before.version,
+                after_version=after.version,
+                changed=changed,
+            )
+            if not changed:
+                result["route"] = "connector-no-changes"
+            changed_parent_keys = [
+                item["key"]
+                for item in changed
+                if not item.get("data", {}).get("parentItem")
+                and item.get("data", {}).get("itemType") != "attachment"
+            ]
+            candidate_keys = list(
+                dict.fromkeys(
+                    [
+                        *changed_parent_keys,
+                        *sorted(after.keys.difference(before.keys)),
+                    ]
+                )
+            )
+            if changed:
+                result["adoption"] = adopt_connector_pdf(
+                    args.parent_key, candidate_keys
+                )
+                result["ok"] = bool(result["adoption"]["ok"])
+                if result["ok"] or result["adoption"].get("duplicateTrashed"):
+                    result["sync"] = sync_library()
     finally:
         if open_url and temporary_window and not args.keep_tab:
             try:
@@ -842,6 +878,8 @@ def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
     if tab_close_error:
         result["tabCloseError"] = tab_close_error
         return 8, result
+    if result.get("interactiveRequired"):
+        return 9, result
     return (0 if result["ok"] else 3), result
 
 
@@ -858,6 +896,12 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
         print(
             f"PDF attached directly to canonical Zotero item "
             f"{result['parentKey']} via native Find Available PDF."
+        )
+    elif result.get("interactiveRequired"):
+        print(
+            f"Interactive access is required for {result['parentKey']}: "
+            f"{result['reason']} ({result['windowTitle']}).",
+            file=sys.stderr,
         )
     elif result.get("adoption", {}).get("ok"):
         adoption = result["adoption"]
@@ -1005,12 +1049,6 @@ def build_parser() -> argparse.ArgumentParser:
     batch_csv.add_argument("--retries", type=int, default=2)
     batch_csv.add_argument("--retry-delay", type=float, default=5.0)
     batch_csv.add_argument("--pause", type=float, default=2.0)
-    batch_csv.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="process at most this many selected rows; 0 means no limit",
-    )
     batch_csv.add_argument("--load-wait", type=float, default=12.0)
     batch_csv.add_argument("--timeout", type=float, default=100.0)
     batch_csv.add_argument("--settle", type=float, default=10.0)

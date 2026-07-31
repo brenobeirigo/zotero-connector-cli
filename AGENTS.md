@@ -28,7 +28,10 @@ Required and recognized columns are:
 - `local_pdf` and `sha256` — updated when present.
 
 Use `--key-column`, `--url-column`, `--status-column`, and `--status-value`
-only when a project's schema differs. Use `--limit N` for a bounded batch.
+only when a project's schema differs. `batch-csv` intentionally has no
+`--limit` option: a multi-paper list must be submitted in one invocation, not
+split into model-driven one-row runs. For a diagnostic, prepare a separate
+one-row CSV explicitly.
 
 The agent/model boundary is strict:
 
@@ -113,6 +116,9 @@ Interpret exit codes as follows:
 
 Exit `6` is a retrieval outcome, not a software failure. Report the unresolved
 items; do not repeatedly rerun unchanged gated or metadata-only sources.
+The report's `interactiveRequired` count identifies anti-bot, sign-in, or
+access-denied pages that need a later human browser handoff. Batch mode closes
+those temporary windows and continues; it does not poll them with a model.
 
 ## Scheduling
 
