@@ -151,6 +151,73 @@ return {{
     )
 
 
+def attach_pdf_file(
+    parent_key: str, file_path: str, wait_seconds: float = 8.0
+) -> dict:
+    key = json.dumps(parent_key)
+    path = json.dumps(file_path)
+    wait_ms = max(0, int(wait_seconds * 1000))
+    return evaluate(
+        f"""
+const item = Zotero.Items.getByLibraryAndKey(Zotero.Libraries.userLibraryID, {key});
+if (!item) throw new Error("Parent item not found: " + {key});
+if (item.deleted) throw new Error("Parent item is in Zotero Trash");
+if (!item.isRegularItem()) throw new Error("Target is not a regular bibliographic item");
+const existingPDFs = item.getAttachments()
+    .map(id => Zotero.Items.get(id))
+    .filter(attachment => attachment.isPDFAttachment() && !attachment.deleted);
+if (existingPDFs.length) {{
+    return {{
+        ok: true,
+        route: "already-present",
+        parentKey: item.key,
+        attachmentKeys: existingPDFs.map(attachment => attachment.key)
+    }};
+}}
+const originalCollectionIDs = [...item.getCollections()].sort((a, b) => a - b);
+const header = await IOUtils.read({path}, {{maxBytes: 5}});
+if (String.fromCharCode(...header) !== "%PDF-") {{
+    throw new Error("Selected file is not a valid PDF");
+}}
+await Zotero.Attachments.importFromFile({{
+    file: {path},
+    parentItemID: item.id
+}});
+await Zotero.Promise.delay({wait_ms});
+const refreshed = Zotero.Items.getByLibraryAndKey(item.libraryID, item.key);
+const finalCollectionIDs = [...refreshed.getCollections()].sort((a, b) => a - b);
+if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)) {{
+    throw new Error("Canonical parent collection memberships changed unexpectedly");
+}}
+const attachments = [];
+for (const id of refreshed.getAttachments()) {{
+    const attachment = Zotero.Items.get(id);
+    if (!attachment.isPDFAttachment() || attachment.deleted) continue;
+    attachments.push({{
+        key: attachment.key,
+        linkMode: attachment.attachmentLinkMode,
+        path: await attachment.getFilePathAsync(),
+        exists: await attachment.fileExists(),
+        annotations: attachment.getAnnotations().length
+    }});
+}}
+const collections = finalCollectionIDs.map(id => {{
+    const collection = Zotero.Collections.get(id);
+    return {{key: collection.key, name: collection.name}};
+}});
+return {{
+    ok: attachments.length === 1 && attachments[0].exists,
+    route: "attach-file",
+    parentKey: refreshed.key,
+    attachments,
+    collections,
+    collectionMembershipsPreserved: true
+}};
+""",
+        timeout=150,
+    )
+
+
 def adopt_connector_pdf(parent_key: str, candidate_keys: list[str]) -> dict:
     parent = json.dumps(parent_key)
     candidates = json.dumps(candidate_keys)
@@ -186,8 +253,9 @@ if (currentPDFs.length) {{
     throw new Error("Canonical parent already has a PDF attachment");
 }}
 
+const candidateKeys = {candidates};
 const matches = [];
-for (const key of {candidates}) {{
+for (const key of candidateKeys) {{
     const candidate = Zotero.Items.getByLibraryAndKey(parent.libraryID, key);
     if (!candidate || candidate.deleted || !candidate.isRegularItem() || candidate.id === parent.id) {{
         continue;
@@ -201,17 +269,101 @@ for (const key of {candidates}) {{
     const pdfs = candidate.getAttachments()
         .map(id => Zotero.Items.get(id))
         .filter(attachment => attachment.isPDFAttachment() && !attachment.deleted);
-    if (pdfs.length) matches.push({{candidate, pdfs, doiMatch, titleMatch}});
+    matches.push({{candidate, pdfs, doiMatch, titleMatch}});
+}}
+
+if (matches.length === 0 && candidateKeys.length === 1) {{
+    const mismatch = Zotero.Items.getByLibraryAndKey(parent.libraryID, candidateKeys[0]);
+    if (mismatch && !mismatch.deleted && mismatch.isRegularItem() && mismatch.id !== parent.id) {{
+        await Zotero.DB.executeTransaction(async () => {{
+            mismatch.deleted = true;
+            await mismatch.save();
+        }});
+        const refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
+        const refreshedMismatch = Zotero.Items.getByLibraryAndKey(parent.libraryID, mismatch.key);
+        const finalCollectionIDs = [...refreshedParent.getCollections()].sort((a, b) => a - b);
+        if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)) {{
+            throw new Error("Canonical parent collection memberships changed unexpectedly");
+        }}
+        const collections = finalCollectionIDs.map(id => {{
+            const collection = Zotero.Collections.get(id);
+            return {{key: collection.key, name: collection.name}};
+        }});
+        const temporaryChildrenLeftInTrash = [];
+        for (const id of refreshedMismatch.getAttachments(true)) {{
+            const child = Zotero.Items.get(id);
+            temporaryChildrenLeftInTrash.push({{
+                key: child.key,
+                title: child.getField("title"),
+                contentType: child.attachmentContentType,
+                linkMode: child.attachmentLinkMode,
+                deleted: child.deleted
+            }});
+        }}
+        return {{
+            ok: false,
+            route: "connector-mismatch",
+            parentKey: refreshedParent.key,
+            duplicateKey: refreshedMismatch.key,
+            duplicateTrashed: refreshedMismatch.deleted,
+            collections,
+            collectionMembershipsPreserved: true,
+            temporaryChildrenLeftInTrash,
+            observed: {{
+                DOI: cleanDOI(refreshedMismatch),
+                title: refreshedMismatch.getField("title"),
+                year: year(refreshedMismatch)
+            }}
+        }};
+    }}
 }}
 
 if (matches.length !== 1) {{
-    throw new Error("Expected exactly one exact duplicate with a PDF; found " + matches.length);
+    throw new Error("Expected exactly one exact temporary duplicate; found " + matches.length);
 }}
-if (matches[0].pdfs.length !== 1) {{
+if (matches[0].pdfs.length > 1) {{
     throw new Error("Expected exactly one PDF on the temporary duplicate; found " + matches[0].pdfs.length);
 }}
 
 const duplicate = matches[0].candidate;
+if (matches[0].pdfs.length === 0) {{
+    await Zotero.DB.executeTransaction(async () => {{
+        duplicate.deleted = true;
+        await duplicate.save();
+    }});
+    const refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
+    const refreshedDuplicate = Zotero.Items.getByLibraryAndKey(parent.libraryID, duplicate.key);
+    const finalCollectionIDs = [...refreshedParent.getCollections()].sort((a, b) => a - b);
+    if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)) {{
+        throw new Error("Canonical parent collection memberships changed unexpectedly");
+    }}
+    const collections = finalCollectionIDs.map(id => {{
+        const collection = Zotero.Collections.get(id);
+        return {{key: collection.key, name: collection.name}};
+    }});
+    const temporaryChildrenLeftInTrash = [];
+    for (const id of refreshedDuplicate.getAttachments(true)) {{
+        const child = Zotero.Items.get(id);
+        temporaryChildrenLeftInTrash.push({{
+            key: child.key,
+            title: child.getField("title"),
+            contentType: child.attachmentContentType,
+            linkMode: child.attachmentLinkMode,
+            deleted: child.deleted
+        }});
+    }}
+    return {{
+        ok: false,
+        route: "connector-no-pdf",
+        parentKey: refreshedParent.key,
+        duplicateKey: refreshedDuplicate.key,
+        duplicateTrashed: refreshedDuplicate.deleted,
+        collections,
+        collectionMembershipsPreserved: true,
+        temporaryChildrenLeftInTrash
+    }};
+}}
+
 const attachment = matches[0].pdfs[0];
 const path = await attachment.getFilePathAsync();
 if (!path || !(await attachment.fileExists())) {{

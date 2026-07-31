@@ -13,11 +13,14 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SW_RESTORE = 9
+WM_CLOSE = 0x0010
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
 VK_SHIFT = 0x10
+VK_MENU = 0x12
 VK_S = 0x53
+VK_W = 0x57
 
 
 ULONG_PTR = wintypes.WPARAM
@@ -67,8 +70,6 @@ class INPUT(ctypes.Structure):
 
 user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 user32.SendInput.restype = wintypes.UINT
-
-
 @dataclass(frozen=True)
 class Window:
     hwnd: int
@@ -147,7 +148,7 @@ def find_browser_window(process_names: set[str], title_contains: str | None = No
         raise RuntimeError(f"No visible browser window found{detail}")
 
     foreground = foreground_window()
-    if foreground:
+    if foreground and not foreground.title.casefold().startswith("the extension "):
         for candidate in candidates:
             if candidate.hwnd == foreground.hwnd:
                 return candidate
@@ -172,8 +173,7 @@ def activate_window(window: Window) -> None:
                 user32.AttachThreadInput(current_thread, foreground_thread, True)
             )
         user32.BringWindowToTop(window.hwnd)
-        if not user32.SetForegroundWindow(window.hwnd):
-            raise ctypes.WinError(ctypes.get_last_error())
+        user32.SetForegroundWindow(window.hwnd)
     finally:
         if attached_foreground:
             user32.AttachThreadInput(current_thread, foreground_thread, False)
@@ -182,14 +182,40 @@ def activate_window(window: Window) -> None:
 
     time.sleep(0.25)
     if user32.GetForegroundWindow() != window.hwnd:
+        alt = (INPUT * 2)(
+            _keyboard_input(VK_MENU),
+            _keyboard_input(VK_MENU, key_up=True),
+        )
+        user32.SendInput(len(alt), alt, ctypes.sizeof(INPUT))
+        user32.BringWindowToTop(window.hwnd)
+        user32.SetForegroundWindow(window.hwnd)
+        time.sleep(0.25)
+    if user32.GetForegroundWindow() != window.hwnd:
         raise RuntimeError(
             "Windows refused to foreground the browser; click the target browser and retry"
         )
 
 
+def close_window(window: Window) -> None:
+    if not user32.PostMessageW(window.hwnd, WM_CLOSE, 0, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 def _keyboard_input(vk: int, key_up: bool = False) -> INPUT:
     flags = KEYEVENTF_KEYUP if key_up else 0
     return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, 0, flags, 0, 0))
+
+
+def send_ctrl_w() -> None:
+    events = (INPUT * 4)(
+        _keyboard_input(VK_CONTROL),
+        _keyboard_input(VK_W),
+        _keyboard_input(VK_W, key_up=True),
+        _keyboard_input(VK_CONTROL, key_up=True),
+    )
+    sent = user32.SendInput(len(events), events, ctypes.sizeof(INPUT))
+    if sent != len(events):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def send_ctrl_shift_s() -> None:

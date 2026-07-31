@@ -11,6 +11,7 @@ from . import __version__
 from .privileged import (
     ZoteroBridgeError,
     adopt_connector_pdf,
+    attach_pdf_file,
     bridge_ping,
     find_available_pdf,
     parent_info,
@@ -18,11 +19,13 @@ from .privileged import (
 )
 from .windows import (
     activate_window,
+    close_window,
     find_browser_executable,
     find_browser_window,
     foreground_window,
     list_windows,
     send_ctrl_shift_s,
+    send_ctrl_w,
 )
 from .zotero import ZoteroUnavailable, ping, state, wait_for_changes
 
@@ -169,6 +172,39 @@ def command_find_pdf(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 4
 
 
+def command_attach_file(args: argparse.Namespace) -> int:
+    ping()
+    source = Path(args.file).expanduser().resolve()
+    if not source.is_file():
+        raise RuntimeError(f"PDF file not found: {source}")
+    with source.open("rb") as stream:
+        if stream.read(5) != b"%PDF-":
+            raise RuntimeError(f"File does not have a PDF signature: {source}")
+    result = attach_pdf_file(
+        args.parent_key,
+        str(source),
+        wait_seconds=args.wait,
+    )
+    if result["ok"] and result["route"] != "already-present":
+        result["sync"] = sync_library()
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif result["ok"]:
+        collections = ", ".join(
+            collection["name"] for collection in result.get("collections", [])
+        ) or "(existing collection)"
+        print(
+            f"PDF attached to canonical Zotero item {result['parentKey']} "
+            f"in: {collections}."
+        )
+    else:
+        print(
+            f"Zotero did not finish attaching the PDF to {result['parentKey']}.",
+            file=sys.stderr,
+        )
+    return 0 if result["ok"] else 5
+
+
 def _run_save(args: argparse.Namespace, open_url: bool) -> int:
     ping()
     canonical = parent_info(args.parent_key)
@@ -216,37 +252,81 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
     if open_url:
         _open_url(browser, args.url)
         time.sleep(args.load_wait)
+        limiter_windows = [
+            candidate
+            for candidate in list_windows()
+            if candidate.process_name in BROWSER_PROCESSES[browser]
+            and candidate.title == "The extension Tab Limiter says"
+        ]
+        for limiter_window in limiter_windows:
+            close_window(limiter_window)
+        if limiter_windows:
+            time.sleep(0.5)
 
     window = find_browser_window(
-        BROWSER_PROCESSES[browser],
-        title_contains=args.title_contains,
+        BROWSER_PROCESSES[browser], title_contains=args.title_contains
     )
     activate_window(window)
     send_ctrl_shift_s()
 
-    after, changed = wait_for_changes(
-        before,
-        timeout=args.timeout,
-        settle_seconds=args.settle,
-    )
-    result = _result_payload(
-        browser=browser,
-        window_title=window.title,
-        before_version=before.version,
-        after_version=after.version,
-        changed=changed,
-    )
-    candidate_keys = [
-        item["key"]
-        for item in changed
-        if not item.get("data", {}).get("parentItem")
-        and item.get("data", {}).get("itemType") != "attachment"
-    ]
-    if changed:
-        result["adoption"] = adopt_connector_pdf(args.parent_key, candidate_keys)
-        result["ok"] = bool(result["adoption"]["ok"])
-        if result["ok"]:
-            result["sync"] = sync_library()
+    tab_close_error = None
+    try:
+        after, changed = wait_for_changes(
+            before,
+            timeout=args.timeout,
+            settle_seconds=args.settle,
+        )
+        result = _result_payload(
+            browser=browser,
+            window_title=window.title,
+            before_version=before.version,
+            after_version=after.version,
+            changed=changed,
+        )
+        changed_parent_keys = [
+            item["key"]
+            for item in changed
+            if not item.get("data", {}).get("parentItem")
+            and item.get("data", {}).get("itemType") != "attachment"
+        ]
+        candidate_keys = list(
+            dict.fromkeys(
+                [
+                    *changed_parent_keys,
+                    *sorted(after.keys.difference(before.keys)),
+                ]
+            )
+        )
+        if changed:
+            result["adoption"] = adopt_connector_pdf(args.parent_key, candidate_keys)
+            result["ok"] = bool(result["adoption"]["ok"])
+            if result["ok"] or result["adoption"].get("duplicateTrashed"):
+                result["sync"] = sync_library()
+    finally:
+        if open_url and not args.keep_tab:
+            try:
+                limiter_windows = [
+                    candidate
+                    for candidate in list_windows()
+                    if candidate.process_name in BROWSER_PROCESSES[browser]
+                    and candidate.title == "The extension Tab Limiter says"
+                ]
+                for limiter_window in limiter_windows:
+                    close_window(limiter_window)
+                if limiter_windows:
+                    time.sleep(0.5)
+                closing_window = find_browser_window(
+                    BROWSER_PROCESSES[browser],
+                    title_contains=args.title_contains,
+                )
+                activate_window(closing_window)
+                send_ctrl_w()
+            except RuntimeError as exc:
+                tab_close_error = str(exc)
+
+    result["tabClosed"] = not tab_close_error
+    if tab_close_error:
+        result["tabCloseError"] = tab_close_error
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -259,6 +339,14 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
         print(
             f"- attachment: {adoption['attachment']['path']} "
             f"[{adoption['attachment']['key']}]"
+        )
+    elif changed and result.get("adoption", {}).get("duplicateTrashed"):
+        adoption = result["adoption"]
+        print(
+            f"The Connector produced no usable matching PDF for canonical item "
+            f"{adoption['parentKey']}; temporary item {adoption['duplicateKey']} "
+            "and its snapshots were moved to Zotero Trash.",
+            file=sys.stderr,
         )
     else:
         print(
@@ -283,6 +371,11 @@ def _add_save_options(parser: argparse.ArgumentParser, include_url: bool) -> Non
     )
     if include_url:
         parser.add_argument("--url", required=True, help="article URL to open")
+        parser.add_argument(
+            "--keep-tab",
+            action="store_true",
+            help="leave the temporary article tab open after the save",
+        )
         parser.add_argument(
             "--load-wait",
             type=float,
@@ -344,6 +437,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     find_pdf.add_argument("--json", action="store_true", help="emit JSON")
     find_pdf.set_defaults(func=command_find_pdf)
+
+    attach_file = subparsers.add_parser(
+        "attach-file",
+        help="attach a downloaded PDF directly to an existing Zotero item",
+    )
+    attach_file.add_argument(
+        "--parent-key", required=True, help="canonical Zotero item key"
+    )
+    attach_file.add_argument("--file", required=True, help="local PDF path")
+    attach_file.add_argument(
+        "--wait",
+        type=float,
+        default=8.0,
+        help="seconds to wait for attachment post-processing",
+    )
+    attach_file.add_argument("--json", action="store_true", help="emit JSON")
+    attach_file.set_defaults(func=command_attach_file)
 
     save = subparsers.add_parser("save", help="open a URL and invoke Save to Zotero")
     _add_save_options(save, include_url=True)

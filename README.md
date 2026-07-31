@@ -46,10 +46,23 @@ zotero-connector save `
   --url "https://www-sciencedirect-com.ezproxy2.utwente.nl/science/article/pii/S0038012119304963"
 ```
 
+The temporary article tab is closed after reconciliation so batch runs do not
+accumulate tabs or trigger browser tab-limit extensions. Use `--keep-tab` only
+when the page must remain open for a login handoff or inspection.
+
 Invoke the Connector on the active browser tab:
 
 ```powershell
 zotero-connector save-active --browser edge --parent-key 4JZVYAIP
+```
+
+Attach a PDF downloaded through a publisher or database UI directly to its
+existing item, without creating a temporary bibliographic record:
+
+```powershell
+zotero-connector attach-file `
+  --parent-key UZVUC4HT `
+  --file "C:\Users\breno\Downloads\EBSCO-FullText-07_31_2026.pdf"
 ```
 
 Use `--json` for machine-readable output. A successful command reports Zotero
@@ -77,6 +90,14 @@ captured before adoption and must be exactly unchanged afterward. Since Zotero
 child attachments follow their parent item, the adopted PDF therefore appears
 in the canonical item's existing project stream rather than the Connector's
 currently selected collection.
+
+If the Connector saves only metadata and a snapshot, with no PDF, the CLI
+still moves that exact temporary duplicate and all of its children to Zotero
+Trash and synchronizes the cleanup.
+
+If a redirected page produces one temporary item whose DOI and title do not
+match the requested parent, the CLI also places that item and its children in
+Trash and reports the mismatch instead of adopting anything.
 
 ## Safety model
 
