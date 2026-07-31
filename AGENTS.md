@@ -30,6 +30,19 @@ Required and recognized columns are:
 Use `--key-column`, `--url-column`, `--status-column`, and `--status-value`
 only when a project's schema differs. Use `--limit N` for a bounded batch.
 
+The agent/model boundary is strict:
+
+1. The agent prepares or locates the complete input CSV once.
+2. The agent invokes one `batch-csv` process for that list.
+3. The script performs every native lookup, browser attempt, cleanup, retry,
+   Zotero reconciliation, hash, CSV checkpoint, and report write serially.
+4. After the process exits, the agent reads the final JSON report once and
+   summarizes the result or requests a login handoff when necessary.
+
+Do not have the model loop over rows, call `save` once per paper, poll browser
+tabs, or convert results manually. Individual commands are for diagnosis or a
+single explicit paper only. Multi-paper work must be one `batch-csv` run.
+
 ## Preconditions
 
 - Zotero Desktop and the CLI Bridge must be running.
@@ -60,6 +73,14 @@ only when a project's schema differs. Use `--limit N` for a bounded batch.
 - A named mutex prevents concurrent batches against the same CSV on one
   machine.
 - Per-item timeouts and transient failures are isolated and retried.
+- Browser work is strictly serial. For each URL, the runner creates a new
+  one-page browser window, records its exact Windows handle, attempts the
+  Connector save, closes that exact window, verifies that it disappeared, and
+  only then advances to the next row. It never guesses which existing user tab
+  should be closed.
+- Batch retrieval runs in one Python process. It does not spawn another CLI
+  process per paper, so cleanup `finally` blocks cannot be bypassed by a parent
+  process timeout.
 
 Do not independently merge or delete temporary records after the run. Inspect
 the report and Zotero final state first.
@@ -70,6 +91,9 @@ The runner writes these files beside the source CSV by default:
 
 - `<stem>.zotero-connector-report.json` — atomic latest-run checkpoint.
 - `<stem>.zotero-connector-runs.jsonl` — append-only event history.
+
+The JSON report declares `executionMode: single-process-serial`. Treat any
+other value as an incompatible or older runner.
 
 After an interruption, reconcile Zotero state without reopening any pages:
 

@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from zotero_connector_cli.cli import (
+    _batch_retrieval_attempt,
     _child_failed_operationally,
+    _child_route,
+    _close_temporary_browser_window,
+    _open_url,
     _single_batch_instance,
     _write_csv_atomic,
     _write_json_atomic,
     build_parser,
+    command_batch_csv,
 )
-from zotero_connector_cli.windows import executable_candidates
+from zotero_connector_cli.windows import Window, executable_candidates
 
 
 class CliTests(unittest.TestCase):
@@ -129,6 +137,67 @@ class CliTests(unittest.TestCase):
                 reconcile_only=True,
             )
         )
+
+    def test_batch_promotes_nested_adoption_route(self) -> None:
+        self.assertEqual(
+            _child_route({"adoption": {"route": "connector-mismatch"}}),
+            "connector-mismatch",
+        )
+
+    @patch("zotero_connector_cli.cli.foreground_window")
+    @patch("zotero_connector_cli.cli.list_windows")
+    @patch("zotero_connector_cli.cli.subprocess.Popen")
+    @patch("zotero_connector_cli.cli.find_browser_executable")
+    @patch("zotero_connector_cli.cli.time.monotonic", side_effect=[0.0, 0.1])
+    def test_open_url_creates_one_isolated_window(
+        self,
+        _monotonic: Mock,
+        executable: Mock,
+        popen: Mock,
+        windows: Mock,
+        foreground: Mock,
+    ) -> None:
+        existing = Window(1, 10, r"C:\Edge\msedge.exe", "Existing")
+        temporary = Window(2, 11, r"C:\Edge\msedge.exe", "Article")
+        executable.return_value = Path(r"C:\Edge\msedge.exe")
+        windows.side_effect = [[existing], [existing, temporary]]
+        foreground.return_value = temporary
+
+        opened = _open_url("edge", "https://example.com/article")
+
+        self.assertEqual(opened, temporary)
+        self.assertIn("--new-window", popen.call_args.args[0])
+        self.assertNotIn("--new-tab", popen.call_args.args[0])
+
+    @patch("zotero_connector_cli.cli.list_windows", return_value=[])
+    @patch("zotero_connector_cli.cli.close_window")
+    def test_close_targets_the_exact_temporary_window(
+        self,
+        close: Mock,
+        _windows: Mock,
+    ) -> None:
+        temporary = Window(2, 11, r"C:\Edge\msedge.exe", "Article")
+        _close_temporary_browser_window(temporary)
+        close.assert_called_once_with(temporary)
+
+    @patch("zotero_connector_cli.cli._execute_save")
+    def test_batch_attempt_uses_internal_serial_save(self, execute: Mock) -> None:
+        execute.return_value = (3, {"ok": False, "route": "connector-no-changes"})
+        args = SimpleNamespace(
+            browser="edge",
+            load_wait=0,
+            timeout=1,
+            settle=0,
+            skip_native=True,
+            native_wait=0,
+        )
+        code, _result = _batch_retrieval_attempt(
+            "ABCD1234", "https://example.com/article", args
+        )
+        self.assertEqual(code, 3)
+        save_args = execute.call_args.args[0]
+        self.assertFalse(save_args.keep_tab)
+        self.assertNotIn("subprocess.run", inspect.getsource(command_batch_csv))
 
     def test_browser_candidates_have_expected_executable_names(self) -> None:
         self.assertTrue(

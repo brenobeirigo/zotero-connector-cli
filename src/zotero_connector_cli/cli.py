@@ -26,6 +26,7 @@ from .privileged import (
     sync_library,
 )
 from .windows import (
+    Window,
     activate_window,
     close_window,
     find_browser_executable,
@@ -33,7 +34,6 @@ from .windows import (
     foreground_window,
     list_windows,
     send_ctrl_shift_s,
-    send_ctrl_w,
 )
 from .zotero import ZoteroUnavailable, ping, state, wait_for_changes
 
@@ -62,22 +62,86 @@ def _choose_browser(requested: str) -> str:
     raise RuntimeError("No supported browser executable found")
 
 
-def _open_url(browser: str, url: str) -> Path:
+def _open_url(browser: str, url: str, timeout: float = 15.0) -> Window:
     executable = find_browser_executable(browser)
     if not executable:
         raise RuntimeError(f"{browser.title()} executable was not found")
+    process_names = BROWSER_PROCESSES[browser]
+    original_hwnds = {
+        window.hwnd
+        for window in list_windows()
+        if window.process_name in process_names
+    }
     args = [str(executable)]
     if browser == "firefox":
-        args.extend(["-new-tab", url])
+        args.extend(["-new-window", url])
     else:
-        args.extend(["--new-tab", url])
+        args.extend(["--new-window", url])
     subprocess.Popen(
         args,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return executable
+    deadline = time.monotonic() + timeout
+    observed_new_windows: dict[int, Window] = {}
+    try:
+        while time.monotonic() < deadline:
+            current = [
+                window
+                for window in list_windows()
+                if window.process_name in process_names
+                and window.hwnd not in original_hwnds
+            ]
+            for window in current:
+                observed_new_windows[window.hwnd] = window
+            limiter_windows = [
+                window
+                for window in current
+                if window.title == "The extension Tab Limiter says"
+            ]
+            for limiter_window in limiter_windows:
+                close_window(limiter_window)
+            candidates = [
+                window
+                for window in current
+                if window.title != "The extension Tab Limiter says"
+            ]
+            if candidates:
+                foreground = foreground_window()
+                if foreground:
+                    for candidate in candidates:
+                        if candidate.hwnd == foreground.hwnd:
+                            return candidate
+                return candidates[0]
+            time.sleep(0.2)
+        raise RuntimeError(
+            f"{browser.title()} did not create an isolated temporary browser window"
+        )
+    except Exception:
+        for window in observed_new_windows.values():
+            try:
+                close_window(window)
+            except OSError:
+                pass
+        raise
+
+
+def _close_temporary_browser_window(window: Window, timeout: float = 10.0) -> None:
+    try:
+        close_window(window)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to close temporary browser window {window.hwnd}: {exc}"
+        ) from exc
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(current.hwnd != window.hwnd for current in list_windows()):
+            return
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"Temporary browser window {window.hwnd} did not close within {timeout} seconds"
+    )
 
 
 def _summarize_item(item: dict) -> dict:
@@ -342,6 +406,44 @@ def _child_failed_operationally(
     return bool(attempts and attempts[-1]["exitCode"] not in (0, 3, 4))
 
 
+def _child_route(child_result: dict) -> str:
+    return (
+        child_result.get("route")
+        or child_result.get("adoption", {}).get("route")
+        or "unknown"
+    )
+
+
+def _batch_retrieval_attempt(
+    parent_key: str,
+    url: str,
+    args: argparse.Namespace,
+) -> tuple[int, dict]:
+    if url:
+        save_args = argparse.Namespace(
+            parent_key=parent_key,
+            browser=args.browser,
+            url=url,
+            keep_tab=False,
+            load_wait=args.load_wait,
+            title_contains=None,
+            timeout=args.timeout,
+            settle=args.settle,
+            skip_native=args.skip_native,
+            native_wait=args.native_wait,
+            json=True,
+        )
+        return _execute_save(save_args, open_url=True)
+    if args.skip_native:
+        return 4, {"ok": False, "route": "no-url", "parentKey": parent_key}
+
+    result = find_available_pdf(parent_key, wait_seconds=args.native_wait)
+    if result["ok"]:
+        result["sync"] = sync_library()
+        return 0, result
+    return 4, result
+
+
 def command_batch_csv(args: argparse.Namespace) -> int:
     csv_path = Path(args.csv).expanduser().resolve()
     if not csv_path.is_file():
@@ -410,6 +512,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 "runId": run_id,
                 "startedAt": started_at,
                 "updatedAt": _timestamp(),
+                "executionMode": "single-process-serial",
                 "csv": str(csv_path),
                 "reportFile": str(report_path),
                 "logFile": str(log_path),
@@ -470,91 +573,22 @@ def command_batch_csv(args: argparse.Namespace) -> int:
             for attempt in range(1, max_attempts + 1):
                 if args.reconcile_only:
                     break
-                if url:
-                    command = [
-                        sys.executable,
-                        "-m",
-                        "zotero_connector_cli",
-                        "save",
-                        "--parent-key",
-                        parent_key,
-                        "--browser",
-                        args.browser,
-                        "--url",
-                        url,
-                        "--load-wait",
-                        str(args.load_wait),
-                        "--timeout",
-                        str(args.timeout),
-                        "--settle",
-                        str(args.settle),
-                        "--native-wait",
-                        str(args.native_wait),
-                        "--json",
-                    ]
-                    if args.skip_native:
-                        command.append("--skip-native")
-                elif not args.skip_native:
-                    command = [
-                        sys.executable,
-                        "-m",
-                        "zotero_connector_cli",
-                        "find-pdf",
-                        "--parent-key",
-                        parent_key,
-                        "--wait",
-                        str(args.native_wait),
-                        "--json",
-                    ]
-                else:
-                    child_result = {
-                        "ok": False,
-                        "route": "no-url",
-                        "parentKey": parent_key,
-                    }
-                    break
-
                 try:
-                    completed = subprocess.run(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=args.timeout + args.load_wait + 180,
-                        check=False,
+                    exit_code, child_result = _batch_retrieval_attempt(
+                        parent_key,
+                        url,
+                        args,
                     )
-                    try:
-                        child_result = json.loads(completed.stdout)
-                    except json.JSONDecodeError:
-                        child_result = {
-                            "ok": False,
-                            "route": "command-error",
-                            "error": (completed.stderr or completed.stdout).strip(),
-                        }
                     attempts.append(
                         {
                             "attempt": attempt,
-                            "exitCode": completed.returncode,
+                            "exitCode": exit_code,
                             "result": child_result,
                         }
                     )
-                    if completed.returncode in (0, 3, 4):
+                    if exit_code in (0, 3, 4, 8):
                         break
-                except subprocess.TimeoutExpired as exc:
-                    child_result = {
-                        "ok": False,
-                        "route": "command-timeout",
-                        "error": f"child command exceeded {exc.timeout} seconds",
-                    }
-                    attempts.append(
-                        {
-                            "attempt": attempt,
-                            "exitCode": None,
-                            "result": child_result,
-                        }
-                    )
-                except OSError as exc:
+                except (RuntimeError, ZoteroUnavailable, ZoteroBridgeError) as exc:
                     child_result = {
                         "ok": False,
                         "route": "command-error",
@@ -610,13 +644,18 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 "parentKey": parent_key,
                 "title": final["title"],
                 "route": (
-                    "final-state-pdf" if final_pdfs else child_result.get("route")
+                    "final-state-pdf" if final_pdfs else _child_route(child_result)
                 ),
                 "attachments": final_pdfs,
                 "collections": final["collections"],
                 "attempts": attempts,
             }
-            if (
+            if child_result.get("cleanupOk") is False:
+                result["operationalError"] = True
+                result["error"] = child_result.get(
+                    "tabCloseError", "temporary browser window cleanup failed"
+                )
+            elif (
                 not final_pdfs
                 and _child_failed_operationally(
                     child_result,
@@ -699,7 +738,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
     return 0 if report["withoutPDF"] == 0 else 6
 
 
-def _run_save(args: argparse.Namespace, open_url: bool) -> int:
+def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
     ping()
     canonical = parent_info(args.parent_key)
     existing_pdfs = [
@@ -715,56 +754,46 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
             "attachments": existing_pdfs,
             "collections": canonical["collections"],
         }
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        else:
-            collections = ", ".join(
-                collection["name"] for collection in canonical["collections"]
-            ) or "(no collection)"
-            print(
-                f"Canonical Zotero item {canonical['key']} already has a PDF "
-                f"in: {collections}."
-            )
-        return 0
+        return 0, result
 
     if not args.skip_native:
         native = find_available_pdf(args.parent_key, wait_seconds=args.native_wait)
         if native["ok"]:
             native["sync"] = sync_library()
-            if args.json:
-                print(json.dumps(native, ensure_ascii=False, indent=2))
-            else:
-                print(
-                    f"PDF attached directly to canonical Zotero item "
-                    f"{native['parentKey']} via native Find Available PDF."
-                )
-            return 0
+            return 0, native
 
     browser = _choose_browser(args.browser)
     before = state()
-
-    if open_url:
-        _open_url(browser, args.url)
-        time.sleep(args.load_wait)
-        limiter_windows = [
-            candidate
-            for candidate in list_windows()
-            if candidate.process_name in BROWSER_PROCESSES[browser]
-            and candidate.title == "The extension Tab Limiter says"
-        ]
-        for limiter_window in limiter_windows:
-            close_window(limiter_window)
-        if limiter_windows:
-            time.sleep(0.5)
-
-    window = find_browser_window(
-        BROWSER_PROCESSES[browser], title_contains=args.title_contains
-    )
-    activate_window(window)
-    send_ctrl_shift_s()
-
+    temporary_window = None
+    result = None
     tab_close_error = None
     try:
+        if open_url:
+            temporary_window = _open_url(browser, args.url)
+            time.sleep(args.load_wait)
+            window = next(
+                (
+                    candidate
+                    for candidate in list_windows()
+                    if candidate.hwnd == temporary_window.hwnd
+                ),
+                temporary_window,
+            )
+            if (
+                args.title_contains
+                and args.title_contains.casefold() not in window.title.casefold()
+            ):
+                raise RuntimeError(
+                    "Temporary browser window title does not contain "
+                    f"{args.title_contains!r}: {window.title}"
+                )
+        else:
+            window = find_browser_window(
+                BROWSER_PROCESSES[browser], title_contains=args.title_contains
+            )
+
+        activate_window(window)
+        send_ctrl_shift_s()
         after, changed = wait_for_changes(
             before,
             timeout=args.timeout,
@@ -777,6 +806,8 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
             after_version=after.version,
             changed=changed,
         )
+        if not changed:
+            result["route"] = "connector-no-changes"
         changed_parent_keys = [
             item["key"]
             for item in changed
@@ -797,34 +828,38 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
             if result["ok"] or result["adoption"].get("duplicateTrashed"):
                 result["sync"] = sync_library()
     finally:
-        if open_url and not args.keep_tab:
+        if open_url and temporary_window and not args.keep_tab:
             try:
-                limiter_windows = [
-                    candidate
-                    for candidate in list_windows()
-                    if candidate.process_name in BROWSER_PROCESSES[browser]
-                    and candidate.title == "The extension Tab Limiter says"
-                ]
-                for limiter_window in limiter_windows:
-                    close_window(limiter_window)
-                if limiter_windows:
-                    time.sleep(0.5)
-                closing_window = find_browser_window(
-                    BROWSER_PROCESSES[browser],
-                    title_contains=args.title_contains,
-                )
-                activate_window(closing_window)
-                send_ctrl_w()
-            except RuntimeError as exc:
+                _close_temporary_browser_window(temporary_window)
+            except (RuntimeError, OSError) as exc:
                 tab_close_error = str(exc)
 
-    result["tabClosed"] = not tab_close_error
+    result["tabClosed"] = bool(
+        open_url and temporary_window and not args.keep_tab and not tab_close_error
+    )
+    result["browserWindowClosed"] = result["tabClosed"]
+    result["cleanupOk"] = not tab_close_error
     if tab_close_error:
         result["tabCloseError"] = tab_close_error
+        return 8, result
+    return (0 if result["ok"] else 3), result
+
+
+def _run_save(args: argparse.Namespace, open_url: bool) -> int:
+    exit_code, result = _execute_save(args, open_url=open_url)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    elif changed and result.get("adoption", {}).get("ok"):
+    elif result.get("route") == "already-present":
+        print(
+            f"Canonical Zotero item {result['parentKey']} already has a PDF."
+        )
+    elif result.get("route") == "native-find-pdf" and result.get("ok"):
+        print(
+            f"PDF attached directly to canonical Zotero item "
+            f"{result['parentKey']} via native Find Available PDF."
+        )
+    elif result.get("adoption", {}).get("ok"):
         adoption = result["adoption"]
         print(
             f"PDF attached to canonical Zotero item {adoption['parentKey']}; "
@@ -834,7 +869,7 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
             f"- attachment: {adoption['attachment']['path']} "
             f"[{adoption['attachment']['key']}]"
         )
-    elif changed and result.get("adoption", {}).get("duplicateTrashed"):
+    elif result.get("adoption", {}).get("duplicateTrashed"):
         adoption = result["adoption"]
         print(
             f"The Connector produced no usable matching PDF for canonical item "
@@ -848,7 +883,7 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
             "Connector installed and Ctrl+Shift+S is assigned to Save to Zotero.",
             file=sys.stderr,
         )
-    return 0 if result["ok"] else 3
+    return exit_code
 
 
 def _add_save_options(parser: argparse.ArgumentParser, include_url: bool) -> None:
@@ -868,7 +903,7 @@ def _add_save_options(parser: argparse.ArgumentParser, include_url: bool) -> Non
         parser.add_argument(
             "--keep-tab",
             action="store_true",
-            help="leave the temporary article tab open after the save",
+            help="leave the isolated temporary browser window open after the save",
         )
         parser.add_argument(
             "--load-wait",

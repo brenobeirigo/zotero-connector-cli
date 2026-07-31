@@ -93,6 +93,16 @@ resume without redoing completed items. The runner also:
 - returns exit code `7` for operational errors and `6` for a clean run that
   simply found no PDF for one or more selected items.
 
+The batch is one local process and one serial loop. For every URL it opens an
+isolated one-page browser window, targets that exact window handle, completes
+the Connector attempt, closes and verifies removal of that exact window, and
+only then opens the next URL. Existing user tabs are never selected for batch
+cleanup. The report records `executionMode: single-process-serial`.
+
+For multi-paper work, the model or agent should only prepare the CSV, invoke
+one `batch-csv` command, and analyze the final report. It must not call `save`
+paper by paper or monitor and steer individual browser attempts.
+
 This execution path is deterministic local software. It does not call an LLM,
 Codex, or any paid API. It still requires Zotero Desktop, the configured Zotero
 Connector, an interactive Windows desktop, and an already authenticated browser
