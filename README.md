@@ -8,6 +8,10 @@ communication with Zotero Desktop.
 
 The CLI never reads browser cookies, profiles, passwords, or extension storage.
 
+Automated agents should follow [AGENTS.md](AGENTS.md), which documents project
+CSV schemas, preconditions, batch/resume commands, exit-code handling, durable
+reports, authentication handoffs, and Zotero safety invariants.
+
 ## Requirements
 
 - Windows 10 or 11
