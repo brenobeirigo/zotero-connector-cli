@@ -13,11 +13,17 @@ from unittest.mock import Mock, patch
 
 from pypdf import PdfWriter
 
+from zotero_connector_cli.ebsco import (
+    activate_pdf_access,
+    build_ebsco_search_url,
+    matches_pdf_access_control,
+)
 from zotero_connector_cli.cli import (
     _batch_retrieval_attempt,
     _child_failed_operationally,
     _child_route,
     _close_temporary_browser_window,
+    _execute_ebsco_pdf,
     _interactive_block_reason,
     _interactive_download_attempt,
     _open_url,
@@ -102,6 +108,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.interactive_wait, 600.0)
         self.assertEqual(args.policy_column, "retrieval_policy")
         self.assertEqual(args.policy_value, "")
+        self.assertFalse(args.skip_ebsco)
+        self.assertEqual(args.ebsco_max_tabs, 220)
 
     def test_batch_rejects_model_driven_limit_loop(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -273,6 +281,9 @@ class CliTests(unittest.TestCase):
         execute.return_value = (3, {"ok": False, "route": "connector-no-changes"})
         args = SimpleNamespace(
             interactive_downloads=False,
+            title_column="title",
+            doi_column="doi",
+            skip_ebsco=True,
             browser="edge",
             load_wait=0,
             timeout=1,
@@ -290,6 +301,136 @@ class CliTests(unittest.TestCase):
         save_args = execute.call_args.args[0]
         self.assertFalse(save_args.keep_tab)
         self.assertNotIn("subprocess.run", inspect.getsource(command_batch_csv))
+
+    def test_ebsco_search_url_uses_ut_proxy_and_exact_title(self) -> None:
+        url = build_ebsco_search_url(
+            "Adaptive Large Neighborhood Search with a Constant-Time Feasibility Test"
+        )
+        self.assertIn("research-ebsco-com.ezproxy2.utwente.nl", url)
+        self.assertIn("q=Adaptive+Large+Neighborhood+Search", url)
+        self.assertIn("searchMode=boolean", url)
+
+    def test_ebsco_access_control_requires_exact_title(self) -> None:
+        title = "Adaptive Large Neighborhood Search with a Constant-Time Feasibility Test"
+        self.assertTrue(
+            matches_pdf_access_control(
+                "Button",
+                f"Access now (PDF) {title}.",
+                title.casefold(),
+            )
+        )
+        self.assertFalse(
+            matches_pdf_access_control(
+                "Button",
+                "Access now (PDF) A different paper.",
+                title,
+            )
+        )
+
+    @patch("zotero_connector_cli.ebsco.time.sleep")
+    @patch("zotero_connector_cli.ebsco.send_keys")
+    @patch("zotero_connector_cli.ebsco._focused_control")
+    @patch("zotero_connector_cli.ebsco.is_foreground", return_value=True)
+    @patch("zotero_connector_cli.ebsco.activate_window")
+    def test_ebsco_access_navigation_is_bounded_and_exact(
+        self,
+        _activate: Mock,
+        _foreground: Mock,
+        focused: Mock,
+        send_keys: Mock,
+        _sleep: Mock,
+    ) -> None:
+        title = "Adaptive Large Neighborhood Search"
+        focused.side_effect = [
+            ("Button", "Search"),
+            ("Button", f"Access now (PDF) {title}."),
+        ]
+        result = activate_pdf_access(
+            Window(2, 11, r"C:\Edge\msedge.exe", "EBSCO"),
+            title=title,
+            max_tabs=5,
+            tab_wait=0,
+        )
+        self.assertEqual(result["tabIndex"], 1)
+        self.assertEqual(
+            [call.args[0] for call in send_keys.call_args_list],
+            ["{F6}", "{TAB}", "{ENTER}"],
+        )
+
+    @patch("zotero_connector_cli.cli._execute_save")
+    @patch("zotero_connector_cli.cli._execute_ebsco_pdf")
+    @patch("zotero_connector_cli.cli.find_available_pdf")
+    def test_informs_batch_prefers_ebsco_before_publisher(
+        self,
+        native: Mock,
+        ebsco: Mock,
+        publisher: Mock,
+    ) -> None:
+        native.return_value = {"ok": False, "route": "native-no-pdf"}
+        ebsco.return_value = (0, {"ok": True, "sourceRoute": "ebsco-access-pdf"})
+        args = SimpleNamespace(
+            interactive_downloads=False,
+            title_column="title",
+            doi_column="doi",
+            skip_ebsco=False,
+            skip_native=False,
+            native_wait=0,
+        )
+        code, result = _batch_retrieval_attempt(
+            "ABCD1234",
+            "https://pubsonline-informs-org.ezproxy2.utwente.nl/doi/epdf/example",
+            {"title": "A paper", "doi": "10.1287/trsc.2018.0837"},
+            args,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(result["sourceRoute"], "ebsco-access-pdf")
+        publisher.assert_not_called()
+
+    @patch("zotero_connector_cli.cli._close_temporary_browser_window")
+    @patch("zotero_connector_cli.cli._invoke_connector")
+    @patch("zotero_connector_cli.cli.activate_pdf_access")
+    @patch("zotero_connector_cli.cli.list_windows")
+    @patch("zotero_connector_cli.cli.time.sleep")
+    @patch("zotero_connector_cli.cli._open_url")
+    @patch("zotero_connector_cli.cli.state", return_value=SimpleNamespace())
+    @patch("zotero_connector_cli.cli.parent_info")
+    @patch("zotero_connector_cli.cli.ping")
+    def test_ebsco_route_invokes_connector_in_viewer_and_closes_window(
+        self,
+        _ping: Mock,
+        parent: Mock,
+        _state: Mock,
+        open_url: Mock,
+        _sleep: Mock,
+        windows: Mock,
+        access: Mock,
+        invoke: Mock,
+        close: Mock,
+    ) -> None:
+        search = Window(2, 11, r"C:\Edge\msedge.exe", "Search results - EBSCO")
+        viewer = Window(2, 11, r"C:\Edge\msedge.exe", "A paper - EBSCO")
+        parent.return_value = {
+            "key": "ABCD1234",
+            "attachments": [],
+            "collections": [{"key": "COLL", "name": "Anticipatory control"}],
+        }
+        open_url.return_value = search
+        windows.return_value = [viewer]
+        access.return_value = {"tabIndex": 55, "controlType": "Button"}
+        invoke.return_value = {"ok": True, "route": "connector-adopt"}
+        args = SimpleNamespace(
+            browser="edge",
+            ebsco_load_wait=1,
+            ebsco_max_tabs=220,
+            ebsco_tab_wait=0.04,
+            timeout=100,
+            settle=10,
+        )
+        code, result = _execute_ebsco_pdf("ABCD1234", "A paper", args)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["sourceRoute"], "ebsco-access-pdf")
+        invoke.assert_called_once()
+        close.assert_called_once_with(search)
 
     def test_interactive_download_without_url_is_classified(self) -> None:
         code, result = _interactive_download_attempt(

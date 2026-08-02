@@ -99,6 +99,25 @@ The standard JSON report declares `executionMode: single-process-serial`.
 Interactive-download mode uses the explicitly documented variant below; treat
 any other value as an incompatible or older runner.
 
+### Automatic EBSCO full-text route
+
+The standard batch automatically searches the University of Twente EBSCO
+collection by exact title. For INFORMS records (`10.1287/*` or a
+`pubsonline.informs.org` access URL), it tries EBSCO before the publisher page;
+for other records it uses EBSCO after a clean publisher/Connector miss. The
+runner opens the generated EBSCO results URL in the authenticated Edge profile,
+uses Windows UI Automation to activate only an exact-title `Access now (PDF)`
+control, waits for the EBSCO viewer, invokes Connector there, adopts the one
+verified PDF into the existing parent, and closes the exact browser window.
+
+This route is local and deterministic. It does not inspect or export cookies,
+does not use model clicks or screen coordinates, and retains the existing
+duplicate/snapshot cleanup and collection-preservation guarantees. Use
+`--skip-ebsco` only for diagnostics. `--ebsco-load-wait`,
+`--ebsco-max-tabs`, and `--ebsco-tab-wait` are bounded recovery controls, not
+per-paper model-loop controls. If EBSCO requires login, MFA, CAPTCHA, or
+consent, stop for Breno's interactive handoff as usual.
+
 ### Manual-review download handoff
 
 When publisher metadata is correct but Connector cannot obtain the file, run

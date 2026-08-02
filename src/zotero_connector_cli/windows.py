@@ -136,6 +136,10 @@ def foreground_window() -> Window | None:
     return matches[0] if matches else None
 
 
+def is_foreground(window: Window) -> bool:
+    return int(user32.GetForegroundWindow() or 0) == window.hwnd
+
+
 def find_browser_window(process_names: set[str], title_contains: str | None = None) -> Window:
     candidates = [
         window

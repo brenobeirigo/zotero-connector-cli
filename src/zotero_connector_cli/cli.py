@@ -19,6 +19,7 @@ from pathlib import Path
 from pypdf import PdfReader
 
 from . import __version__
+from .ebsco import activate_pdf_access, build_ebsco_search_url
 from .privileged import (
     ZoteroBridgeError,
     adopt_connector_pdf,
@@ -535,6 +536,15 @@ def _child_route(child_result: dict) -> str:
     )
 
 
+def _prefers_ebsco(url: str, row: dict, doi_column: str) -> bool:
+    doi = row.get(doi_column, "").strip().casefold()
+    normalized_url = url.casefold()
+    return doi.startswith("10.1287/") or any(
+        marker in normalized_url
+        for marker in ("pubsonline.informs.org", "pubsonline-informs-org")
+    )
+
+
 def _interactive_block_reason(title: str) -> str | None:
     normalized = " ".join(title.casefold().split())
     indicators = {
@@ -557,14 +567,39 @@ def _batch_retrieval_attempt(
     row: dict,
     args: argparse.Namespace,
 ) -> tuple[int, dict]:
+    title = row.get(args.title_column, "").strip()
     if args.interactive_downloads:
         return _interactive_download_attempt(
             parent_key=parent_key,
             url=url,
-            title=row.get(args.title_column, "").strip(),
+            title=title,
             doi=row.get(args.doi_column, "").strip(),
             args=args,
         )
+
+    prefer_ebsco = (
+        not args.skip_ebsco
+        and bool(title)
+        and _prefers_ebsco(url, row, args.doi_column)
+    )
+    skip_native_for_publisher = args.skip_native
+    native_attempted = False
+    if prefer_ebsco:
+        if not args.skip_native:
+            native_attempted = True
+            native = find_available_pdf(parent_key, wait_seconds=args.native_wait)
+            if native["ok"]:
+                native["sync"] = sync_library()
+                return 0, native
+        ebsco_code, ebsco_result = _execute_ebsco_pdf(
+            parent_key=parent_key,
+            title=title,
+            args=args,
+        )
+        if ebsco_code in (0, 8, 9):
+            return ebsco_code, ebsco_result
+        skip_native_for_publisher = True
+
     if url:
         save_args = argparse.Namespace(
             parent_key=parent_key,
@@ -575,19 +610,36 @@ def _batch_retrieval_attempt(
             title_contains=None,
             timeout=args.timeout,
             settle=args.settle,
-            skip_native=args.skip_native,
+            skip_native=skip_native_for_publisher,
             native_wait=args.native_wait,
             json=True,
         )
-        return _execute_save(save_args, open_url=True)
-    if args.skip_native:
-        return 4, {"ok": False, "route": "no-url", "parentKey": parent_key}
+        publisher_code, publisher_result = _execute_save(save_args, open_url=True)
+        if publisher_code == 0 or args.skip_ebsco or not title or prefer_ebsco:
+            if prefer_ebsco:
+                publisher_result["ebscoAttempt"] = ebsco_result
+            return publisher_code, publisher_result
+        if publisher_code == 8:
+            return publisher_code, publisher_result
+        ebsco_code, ebsco_result = _execute_ebsco_pdf(
+            parent_key=parent_key,
+            title=title,
+            args=args,
+        )
+        ebsco_result["publisherAttempt"] = publisher_result
+        if ebsco_code in (0, 8, 9):
+            return ebsco_code, ebsco_result
+        publisher_result["ebscoAttempt"] = ebsco_result
+        return publisher_code, publisher_result
 
-    result = find_available_pdf(parent_key, wait_seconds=args.native_wait)
-    if result["ok"]:
-        result["sync"] = sync_library()
-        return 0, result
-    return 4, result
+    if not args.skip_native and not native_attempted:
+        native = find_available_pdf(parent_key, wait_seconds=args.native_wait)
+        if native["ok"]:
+            native["sync"] = sync_library()
+            return 0, native
+    if not args.skip_ebsco and title:
+        return _execute_ebsco_pdf(parent_key=parent_key, title=title, args=args)
+    return 4, {"ok": False, "route": "no-url", "parentKey": parent_key}
 
 
 def _interactive_download_attempt(
@@ -734,8 +786,12 @@ def command_batch_csv(args: argparse.Namespace) -> int:
         args.settle,
         args.native_wait,
         args.interactive_wait,
+        args.ebsco_load_wait,
+        args.ebsco_tab_wait,
     ) < 0:
         raise RuntimeError("batch timing options must be zero or greater")
+    if args.ebsco_max_tabs <= 0:
+        raise RuntimeError("--ebsco-max-tabs must be greater than zero")
     report_path = (
         Path(args.report_file).expanduser().resolve()
         if args.report_file
@@ -951,6 +1007,9 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 "collections": final["collections"],
                 "attempts": attempts,
             }
+            if child_result.get("interactiveRequired"):
+                result["interactiveRequired"] = True
+                result["interactiveReason"] = child_result.get("reason")
             if child_result.get("cleanupOk") is False:
                 result["operationalError"] = True
                 result["error"] = child_result.get(
@@ -1042,6 +1101,180 @@ def command_batch_csv(args: argparse.Namespace) -> int:
     return 0 if report["withoutPDF"] == 0 else 6
 
 
+def _invoke_connector(
+    parent_key: str,
+    browser: str,
+    window: Window,
+    before,
+    timeout: float,
+    settle: float,
+) -> dict:
+    activate_window(window)
+    send_ctrl_shift_s()
+    after, changed = wait_for_changes(
+        before,
+        timeout=timeout,
+        settle_seconds=settle,
+    )
+    result = _result_payload(
+        browser=browser,
+        window_title=window.title,
+        before_version=before.version,
+        after_version=after.version,
+        changed=changed,
+    )
+    if not changed:
+        result["route"] = "connector-no-changes"
+        return result
+
+    changed_parent_keys = [
+        item["key"]
+        for item in changed
+        if not item.get("data", {}).get("parentItem")
+        and item.get("data", {}).get("itemType") != "attachment"
+    ]
+    candidate_keys = list(
+        dict.fromkeys(
+            [
+                *changed_parent_keys,
+                *sorted(after.keys.difference(before.keys)),
+            ]
+        )
+    )
+    result["adoption"] = adopt_connector_pdf(parent_key, candidate_keys)
+    result["ok"] = bool(result["adoption"]["ok"])
+    if result["ok"] or result["adoption"].get("duplicateTrashed"):
+        result["sync"] = sync_library()
+    return result
+
+
+def _execute_ebsco_pdf(
+    parent_key: str,
+    title: str,
+    args: argparse.Namespace,
+) -> tuple[int, dict]:
+    ping()
+    canonical = parent_info(parent_key)
+    existing_pdfs = [
+        attachment
+        for attachment in canonical["attachments"]
+        if attachment["isPDF"] and not attachment["deleted"]
+    ]
+    if existing_pdfs:
+        return 0, {
+            "ok": True,
+            "route": "already-present",
+            "parentKey": canonical["key"],
+            "attachments": existing_pdfs,
+            "collections": canonical["collections"],
+        }
+
+    browser = _choose_browser(args.browser)
+    search_url = build_ebsco_search_url(title)
+    before = state()
+    temporary_window = None
+    close_error = None
+    result = None
+    exit_code = 4
+    try:
+        temporary_window = _open_url(browser, search_url)
+        time.sleep(args.ebsco_load_wait)
+        window = next(
+            (
+                candidate
+                for candidate in list_windows()
+                if candidate.hwnd == temporary_window.hwnd
+            ),
+            temporary_window,
+        )
+        block_reason = _interactive_block_reason(window.title)
+        if block_reason:
+            result = {
+                "ok": False,
+                "route": "interactive-required",
+                "interactiveRequired": True,
+                "reason": block_reason,
+                "browser": browser,
+                "windowTitle": window.title,
+                "parentKey": parent_key,
+                "url": search_url,
+                "sourceRoute": "ebsco-search",
+            }
+            exit_code = 9
+        else:
+            access = activate_pdf_access(
+                window,
+                title=title,
+                max_tabs=args.ebsco_max_tabs,
+                tab_wait=args.ebsco_tab_wait,
+            )
+            if not access:
+                result = {
+                    "ok": False,
+                    "route": "ebsco-no-pdf-access",
+                    "parentKey": parent_key,
+                    "browser": browser,
+                    "windowTitle": window.title,
+                    "url": search_url,
+                    "sourceRoute": "ebsco-search",
+                }
+            else:
+                deadline = time.monotonic() + args.ebsco_load_wait
+                viewer = window
+                while time.monotonic() < deadline:
+                    viewer = next(
+                        (
+                            candidate
+                            for candidate in list_windows()
+                            if candidate.hwnd == temporary_window.hwnd
+                        ),
+                        viewer,
+                    )
+                    normalized_title = viewer.title.casefold()
+                    if "ebsco" in normalized_title and "search results" not in normalized_title:
+                        break
+                    time.sleep(0.2)
+                else:
+                    result = {
+                        "ok": False,
+                        "route": "ebsco-viewer-timeout",
+                        "parentKey": parent_key,
+                        "browser": browser,
+                        "windowTitle": viewer.title,
+                        "url": search_url,
+                        "sourceRoute": "ebsco-access-pdf",
+                        "ebscoAccess": access,
+                    }
+                    exit_code = 5
+
+                if result is None:
+                    result = _invoke_connector(
+                        parent_key=parent_key,
+                        browser=browser,
+                        window=viewer,
+                        before=before,
+                        timeout=args.timeout,
+                        settle=args.settle,
+                    )
+                    result["sourceRoute"] = "ebsco-access-pdf"
+                    result["ebscoAccess"] = access
+                    result["ebscoSearchUrl"] = search_url
+                    exit_code = 0 if result["ok"] else 3
+    finally:
+        if temporary_window:
+            try:
+                _close_temporary_browser_window(temporary_window)
+            except (RuntimeError, OSError) as exc:
+                close_error = str(exc)
+
+    result["browserWindowClosed"] = not close_error
+    result["cleanupOk"] = not close_error
+    if close_error:
+        result["tabCloseError"] = close_error
+        return 8, result
+    return exit_code, result
+
+
 def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
     ping()
     canonical = parent_info(args.parent_key)
@@ -1109,43 +1342,14 @@ def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
                 "url": args.url,
             }
         else:
-            activate_window(window)
-            send_ctrl_shift_s()
-            after, changed = wait_for_changes(
-                before,
-                timeout=args.timeout,
-                settle_seconds=args.settle,
-            )
-            result = _result_payload(
+            result = _invoke_connector(
+                parent_key=args.parent_key,
                 browser=browser,
-                window_title=window.title,
-                before_version=before.version,
-                after_version=after.version,
-                changed=changed,
+                window=window,
+                before=before,
+                timeout=args.timeout,
+                settle=args.settle,
             )
-            if not changed:
-                result["route"] = "connector-no-changes"
-            changed_parent_keys = [
-                item["key"]
-                for item in changed
-                if not item.get("data", {}).get("parentItem")
-                and item.get("data", {}).get("itemType") != "attachment"
-            ]
-            candidate_keys = list(
-                dict.fromkeys(
-                    [
-                        *changed_parent_keys,
-                        *sorted(after.keys.difference(before.keys)),
-                    ]
-                )
-            )
-            if changed:
-                result["adoption"] = adopt_connector_pdf(
-                    args.parent_key, candidate_keys
-                )
-                result["ok"] = bool(result["adoption"]["ok"])
-                if result["ok"] or result["adoption"].get("duplicateTrashed"):
-                    result["sync"] = sync_library()
     finally:
         if open_url and temporary_window and not args.keep_tab:
             try:
@@ -1342,6 +1546,29 @@ def build_parser() -> argparse.ArgumentParser:
     batch_csv.add_argument("--timeout", type=float, default=100.0)
     batch_csv.add_argument("--settle", type=float, default=10.0)
     batch_csv.add_argument("--native-wait", type=float, default=8.0)
+    batch_csv.add_argument(
+        "--skip-ebsco",
+        action="store_true",
+        help="disable the automatic University of Twente EBSCO PDF fallback",
+    )
+    batch_csv.add_argument(
+        "--ebsco-load-wait",
+        type=float,
+        default=7.0,
+        help="seconds to allow EBSCO search results and the PDF viewer to load",
+    )
+    batch_csv.add_argument(
+        "--ebsco-max-tabs",
+        type=int,
+        default=220,
+        help="maximum accessible controls to inspect for exact-title PDF access",
+    )
+    batch_csv.add_argument(
+        "--ebsco-tab-wait",
+        type=float,
+        default=0.04,
+        help="seconds between accessibility focus steps on EBSCO",
+    )
     batch_csv.add_argument(
         "--interactive-downloads",
         action="store_true",

@@ -126,6 +126,16 @@ isolated windows are closed before the batch continues, and the final report's
 `interactiveRequired` count tells an agent when Breno needs a later login
 handoff.
 
+The standard batch also includes an automatic University of Twente EBSCO
+full-text route. INFORMS items (`10.1287/*` or a Pubsonline access URL) go to
+EBSCO before the publisher page; other clean publisher misses receive EBSCO as
+a fallback. The CLI generates an exact-title EBSCO search, activates only the
+matching `Access now (PDF)` accessibility control, waits for the EBSCO viewer,
+and invokes Zotero Connector there. It uses the signed-in Edge session without
+reading cookies, uses no model or screen coordinates, attaches only to the
+canonical parent, preserves collections, and closes the exact browser window.
+Use `--skip-ebsco` only when diagnosing this route.
+
 For that handoff, process the whole review queue with no model monitoring:
 
 ```powershell
