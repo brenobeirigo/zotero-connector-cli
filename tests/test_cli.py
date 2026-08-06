@@ -24,18 +24,26 @@ from zotero_connector_cli.cli import (
     _child_route,
     _close_temporary_browser_window,
     _execute_ebsco_pdf,
+    _execute_save,
+    _matching_changed_parent_keys,
     _interactive_block_reason,
     _interactive_download_attempt,
     _open_url,
+    _remote_download_attempt,
     _single_batch_instance,
     _validate_pdf_identity,
     _wait_for_verified_download,
+    _wait_for_browser_page_ready,
     _write_csv_atomic,
     _write_json_atomic,
     build_parser,
     command_batch_csv,
 )
-from zotero_connector_cli.windows import Window, executable_candidates
+from zotero_connector_cli.windows import (
+    Window,
+    browser_document_state,
+    executable_candidates,
+)
 
 
 class CliTests(unittest.TestCase):
@@ -110,6 +118,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.policy_value, "")
         self.assertFalse(args.skip_ebsco)
         self.assertEqual(args.ebsco_max_tabs, 220)
+        self.assertEqual(args.remote_host, "")
+        self.assertEqual(args.remote_url_column, "remote_url")
 
     def test_batch_rejects_model_driven_limit_loop(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -276,6 +286,150 @@ class CliTests(unittest.TestCase):
         _close_temporary_browser_window(temporary)
         close.assert_called_once_with(temporary)
 
+    def test_browser_document_state_recognizes_reload_as_complete(self) -> None:
+        document = SimpleNamespace(
+            element_info=SimpleNamespace(
+                control_type="Document",
+                name="A paper",
+            )
+        )
+        reload_button = SimpleNamespace(
+            element_info=SimpleNamespace(
+                control_type="Button",
+                name="Reload this page",
+            )
+        )
+        with patch("zotero_connector_cli.windows.Desktop") as desktop:
+            desktop.return_value.window.return_value.descendants.return_value = [
+                document,
+                reload_button,
+            ]
+            result = browser_document_state(
+                Window(2, 11, r"C:\Edge\msedge.exe", "A paper")
+            )
+        self.assertTrue(result["observable"])
+        self.assertTrue(result["complete"])
+
+    @patch("zotero_connector_cli.cli.time.sleep")
+    @patch(
+        "zotero_connector_cli.cli.time.monotonic",
+        side_effect=[0.0, 0.0, 0.1],
+    )
+    @patch("zotero_connector_cli.cli.browser_document_state")
+    @patch("zotero_connector_cli.cli.list_windows")
+    def test_page_readiness_waits_until_browser_reports_complete(
+        self,
+        windows: Mock,
+        document_state: Mock,
+        _monotonic: Mock,
+        sleep: Mock,
+    ) -> None:
+        window = Window(2, 11, r"C:\Edge\msedge.exe", "A paper")
+        windows.return_value = [window]
+        document_state.side_effect = [
+            {
+                "observable": True,
+                "complete": False,
+                "documentName": "A paper",
+                "loadingIndicator": True,
+            },
+            {
+                "observable": True,
+                "complete": True,
+                "documentName": "A paper",
+                "readyIndicator": "reload this page",
+            },
+        ]
+
+        ready_window, readiness = _wait_for_browser_page_ready(
+            window,
+            timeout=10,
+            stable_seconds=0,
+        )
+
+        self.assertEqual(ready_window, window)
+        self.assertEqual(readiness["mode"], "uia-document-ready")
+        sleep.assert_called_once()
+
+    @patch("zotero_connector_cli.cli.time.sleep")
+    @patch(
+        "zotero_connector_cli.cli.time.monotonic",
+        side_effect=[0.0, 0.0, 5.0],
+    )
+    @patch(
+        "zotero_connector_cli.cli.browser_document_state",
+        return_value={
+            "observable": True,
+            "complete": False,
+            "documentName": "A paper",
+            "loadingIndicator": True,
+        },
+    )
+    @patch("zotero_connector_cli.cli.list_windows")
+    def test_page_readiness_never_invokes_after_observed_loading_timeout(
+        self,
+        windows: Mock,
+        _document_state: Mock,
+        _monotonic: Mock,
+        _sleep: Mock,
+    ) -> None:
+        window = Window(2, 11, r"C:\Edge\msedge.exe", "A paper")
+        windows.return_value = [window]
+
+        with self.assertRaisesRegex(RuntimeError, "still loading"):
+            _wait_for_browser_page_ready(window, timeout=5)
+
+    def test_publisher_save_waits_for_page_readiness_before_connector(self) -> None:
+        opening = Window(2, 11, r"C:\Edge\msedge.exe", "Loading...")
+        ready = Window(2, 11, r"C:\Edge\msedge.exe", "A paper")
+        events = []
+
+        def wait_for_ready(*_args, **_kwargs):
+            events.append("ready")
+            return ready, {"mode": "uia-document-ready"}
+
+        def invoke(**_kwargs):
+            events.append("invoke")
+            return {"ok": False, "route": "connector-no-changes"}
+
+        args = SimpleNamespace(
+            parent_key="ABCD1234",
+            skip_native=True,
+            browser="edge",
+            url="https://example.com/article",
+            load_wait=30,
+            title_contains=None,
+            timeout=100,
+            settle=10,
+            keep_tab=False,
+        )
+        with (
+            patch("zotero_connector_cli.cli.ping"),
+            patch(
+                "zotero_connector_cli.cli.parent_info",
+                return_value={"key": "ABCD1234", "attachments": [], "collections": []},
+            ),
+            patch("zotero_connector_cli.cli._choose_browser", return_value="edge"),
+            patch(
+                "zotero_connector_cli.cli.state",
+                return_value=SimpleNamespace(version=1),
+            ),
+            patch("zotero_connector_cli.cli._open_url", return_value=opening),
+            patch(
+                "zotero_connector_cli.cli._wait_for_browser_page_ready",
+                side_effect=wait_for_ready,
+            ) as readiness,
+            patch("zotero_connector_cli.cli._invoke_connector", side_effect=invoke) as connector,
+            patch("zotero_connector_cli.cli._close_temporary_browser_window"),
+        ):
+            code, result = _execute_save(args, open_url=True)
+
+        self.assertEqual(code, 3)
+        self.assertEqual(events, ["ready", "invoke"])
+        readiness.assert_called_once_with(opening, timeout=30)
+        self.assertEqual(connector.call_args.kwargs["window"], ready)
+        self.assertEqual(result["pageReadiness"]["mode"], "uia-document-ready")
+
     @patch("zotero_connector_cli.cli._execute_save")
     def test_batch_attempt_uses_internal_serial_save(self, execute: Mock) -> None:
         execute.return_value = (3, {"ok": False, "route": "connector-no-changes"})
@@ -302,6 +456,95 @@ class CliTests(unittest.TestCase):
         self.assertFalse(save_args.keep_tab)
         self.assertNotIn("subprocess.run", inspect.getsource(command_batch_csv))
 
+    @patch("zotero_connector_cli.cli._execute_save")
+    @patch("zotero_connector_cli.cli._execute_ebsco_pdf")
+    def test_failed_publisher_and_ebsco_attempts_remain_json_serializable(
+        self,
+        ebsco: Mock,
+        publisher: Mock,
+    ) -> None:
+        publisher.return_value = (
+            3,
+            {"ok": False, "route": "connector-no-pdf"},
+        )
+        ebsco.return_value = (
+            4,
+            {"ok": False, "route": "connector-mismatch"},
+        )
+        args = SimpleNamespace(
+            interactive_downloads=False,
+            title_column="title",
+            doi_column="doi",
+            skip_ebsco=False,
+            browser="edge",
+            load_wait=0,
+            timeout=1,
+            settle=0,
+            skip_native=True,
+            native_wait=0,
+        )
+
+        code, result = _batch_retrieval_attempt(
+            "ABCD1234",
+            "https://example.com/article",
+            {"title": "A paper", "doi": "10.1000/example"},
+            args,
+        )
+
+        self.assertEqual(code, 3)
+        self.assertEqual(result["ebscoAttempt"]["route"], "connector-mismatch")
+        self.assertNotIn("publisherAttempt", result["ebscoAttempt"])
+        json.dumps(result)
+
+    def test_remote_download_attaches_only_verified_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = SimpleNamespace(
+                remote_staging_dir=directory,
+                remote_host="user@remote-host",
+                remote_timeout=30,
+                remote_connect_timeout=5,
+                native_wait=0,
+            )
+
+            def fake_fetch(_host, _url, destination, **_kwargs):
+                writer = PdfWriter()
+                writer.add_blank_page(width=72, height=72)
+                writer.add_metadata({"/Title": "Network flows theory algorithms applications"})
+                with destination.open("wb") as stream:
+                    writer.write(stream)
+                return {
+                    "ok": True,
+                    "sha256": __import__("hashlib").sha256(
+                        destination.read_bytes()
+                    ).hexdigest().upper(),
+                }
+
+            def fake_attach(_key, file_path, wait_seconds=0):
+                canonical = root / "canonical.pdf"
+                canonical.write_bytes(Path(file_path).read_bytes())
+                return {
+                    "ok": True,
+                    "attachments": [{"path": str(canonical), "exists": True}],
+                    "collections": [],
+                }
+
+            with (
+                patch("zotero_connector_cli.cli.fetch_pdf_over_ssh", side_effect=fake_fetch),
+                patch("zotero_connector_cli.cli.attach_pdf_file", side_effect=fake_attach),
+                patch("zotero_connector_cli.cli.sync_library", return_value={"ok": True}),
+            ):
+                code, result = _remote_download_attempt(
+                    "ABCD1234",
+                    "https://example.edu/network-flows.pdf",
+                    "Network Flows: Theory, Algorithms, and Applications",
+                    "",
+                    args,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(result["route"], "remote-ssh-attach")
+            self.assertTrue(result["stagingRemoved"])
+
     def test_ebsco_search_url_uses_ut_proxy_and_exact_title(self) -> None:
         url = build_ebsco_search_url(
             "Adaptive Large Neighborhood Search with a Constant-Time Feasibility Test"
@@ -309,6 +552,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("research-ebsco-com.ezproxy2.utwente.nl", url)
         self.assertIn("q=Adaptive+Large+Neighborhood+Search", url)
         self.assertIn("searchMode=boolean", url)
+
+    def test_interrupted_save_recovery_filters_to_exact_work(self) -> None:
+        args = SimpleNamespace(title_column="title", doi_column="doi")
+        changed = [
+            {
+                "key": "MATCH123",
+                "data": {
+                    "itemType": "journalArticle",
+                    "title": "The Target Paper",
+                    "DOI": "10.1000/target",
+                },
+            },
+            {
+                "key": "OTHER123",
+                "data": {
+                    "itemType": "journalArticle",
+                    "title": "An Unrelated Paper",
+                    "DOI": "10.1000/other",
+                },
+            },
+        ]
+        keys = _matching_changed_parent_keys(
+            changed,
+            "CANONICAL",
+            {"title": "The Target Paper", "doi": "https://doi.org/10.1000/target"},
+            args,
+        )
+        self.assertEqual(keys, ["MATCH123"])
 
     def test_ebsco_access_control_requires_exact_title(self) -> None:
         title = "Adaptive Large Neighborhood Search with a Constant-Time Feasibility Test"
@@ -387,6 +658,7 @@ class CliTests(unittest.TestCase):
         publisher.assert_not_called()
 
     @patch("zotero_connector_cli.cli._close_temporary_browser_window")
+    @patch("zotero_connector_cli.cli._wait_for_browser_page_ready")
     @patch("zotero_connector_cli.cli._invoke_connector")
     @patch("zotero_connector_cli.cli.activate_pdf_access")
     @patch("zotero_connector_cli.cli.list_windows")
@@ -405,6 +677,7 @@ class CliTests(unittest.TestCase):
         windows: Mock,
         access: Mock,
         invoke: Mock,
+        readiness: Mock,
         close: Mock,
     ) -> None:
         search = Window(2, 11, r"C:\Edge\msedge.exe", "Search results - EBSCO")
@@ -415,7 +688,10 @@ class CliTests(unittest.TestCase):
             "collections": [{"key": "COLL", "name": "Anticipatory control"}],
         }
         open_url.return_value = search
-        windows.return_value = [viewer]
+        readiness.side_effect = [
+            (search, {"mode": "uia-document-ready"}),
+            (viewer, {"mode": "uia-document-ready"}),
+        ]
         access.return_value = {"tabIndex": 55, "controlType": "Button"}
         invoke.return_value = {"ok": True, "route": "connector-adopt"}
         args = SimpleNamespace(

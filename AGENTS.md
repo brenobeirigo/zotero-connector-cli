@@ -56,7 +56,7 @@ single explicit paper only. Multi-paper work must be one `batch-csv` run.
 - Keep an interactive, unlocked Windows session. Browser shortcuts do not work
   in a non-interactive service session.
 - The browser may reuse an authenticated session, but an agent must hand login,
-  MFA, CAPTCHA, or consent prompts to Breno. Never request, inspect, export, or
+  MFA, CAPTCHA, or consent prompts to the user. Never request, inspect, export, or
   store credentials, cookies, tokens, or profiles.
 - Follow the active `zotero:` library `AGENTS.md`, including OneDrive and
   Zotero synchronization checks before and after authorized attachment writes.
@@ -76,6 +76,10 @@ single explicit paper only. Multi-paper work must be one `batch-csv` run.
 - A named mutex prevents concurrent batches against the same CSV on one
   machine.
 - Per-item timeouts and transient failures are isolated and retried.
+- If Zotero becomes temporarily unreachable after the Connector has already
+  saved an item, the runner reconciles exact DOI/title changes from that
+  attempt before retrying. This prevents an unobserved successful save from
+  leaving an active duplicate when the next retry begins.
 - Browser work is strictly serial. For each URL, the runner creates a new
   one-page browser window, records its exact Windows handle, attempts the
   Connector save, closes that exact window, verifies that it disappeared, and
@@ -87,6 +91,65 @@ single explicit paper only. Multi-paper work must be one `batch-csv` run.
 
 Do not independently merge or delete temporary records after the run. Inspect
 the report and Zotero final state first.
+
+### Tailscale SSH fallback
+
+When a lawful direct PDF URL is inaccessible from the current Windows host but reachable
+from another Tailscale machine, add that URL to a `remote_url` CSV column and
+run the same complete serial batch with:
+
+```powershell
+zotero-connector batch-csv `
+  --csv "<project-output>\pdf-status.csv" `
+  --browser edge `
+  --remote-host "user@remote-host" `
+  --update-csv
+```
+
+Local native, publisher, and EBSCO retrieval remains first. On a clean miss,
+the runner downloads the explicit HTTPS `remote_url` to a random remote `/tmp`
+path, copies it to collision-resistant local staging with SCP, deletes the
+remote temporary file, validates PDF signature, SHA-256, page readability, and
+DOI/title identity, and attaches only the verified file to the existing
+canonical parent. It verifies the canonical attachment hash before removing a
+successful local staging copy; mismatches remain staged beside the CSV for
+review. The host, URL, checksums, and validation are recorded in the standard
+atomic report and JSONL log. The route stays inside the existing one-process,
+one-paper-at-a-time batch loop and requires no model monitoring.
+
+Use only a lawful open-access, institutional, publisher, repository, or
+user-authorized direct PDF URL. The remote fallback must not search, invoke, or
+automate LibGen, Sci-Hub, Anna's Archive, Z-Library, or equivalent
+unauthorized-copy services; the CLI rejects known piracy domains. Never store
+SSH keys, Tailscale credentials, cookies, or passwords in the CSV, report, or
+shared documentation. The remote host must already accept non-interactive
+OpenSSH authentication from the current Windows host.
+
+## Globally deduplicated BibTeX import
+
+Use `import-bib` when staged `.bib` files must become one level of project
+subcollections. It uses the write-capable local CLI Bridge; do not block on or
+request `ZOTERO_API_KEY`.
+
+```powershell
+zotero-connector import-bib `
+  --bib-dir "<staged-bib-directory>" `
+  --parent-name "<existing-project-collection>"
+
+zotero-connector import-bib `
+  --bib-dir "<staged-bib-directory>" `
+  --parent-name "<existing-project-collection>" `
+  --apply
+```
+
+Always inspect the dry run before `--apply`. Matching is global across the
+library by DOI, then normalized title/year, so an existing canonical item is
+added to the target collection rather than duplicated. A record already in a
+different leaf of the same project is preserved and reported; the importer
+never creates two project-stream memberships or silently reclassifies it.
+Ambiguous global matches fail closed. New records are created only when no
+global match exists, all changes run in one Zotero database transaction, and
+Zotero sync runs once at the end.
 
 ## Resume, reports, and exit codes
 
@@ -116,7 +179,7 @@ duplicate/snapshot cleanup and collection-preservation guarantees. Use
 `--skip-ebsco` only for diagnostics. `--ebsco-load-wait`,
 `--ebsco-max-tabs`, and `--ebsco-tab-wait` are bounded recovery controls, not
 per-paper model-loop controls. If EBSCO requires login, MFA, CAPTCHA, or
-consent, stop for Breno's interactive handoff as usual.
+consent, stop for the user's interactive handoff as usual.
 
 ### Manual-review download handoff
 
@@ -135,7 +198,7 @@ zotero-connector batch-csv `
 ```
 
 This remains a single-process serial batch. For each row with an `access_url`,
-the script opens one isolated window and waits while Breno completes any
+the script opens one isolated window and waits while the user completes any
 login/challenge and uses the publisher's real download control. It watches the
 browser download directory, accepts only a stable `%PDF-` file whose DOI or
 title matches the CSV row, attaches it to the canonical Zotero parent, updates
@@ -180,8 +243,8 @@ those temporary windows and continues; it does not poll them with a model.
 ## Scheduling
 
 The cheapest execution is a local manual run. If recurring execution is
-explicitly requested, only the hub scheduler owner (`PARABELLUM`) may configure
-it. Windows Task Scheduler must use **Run only when user is logged on**, keep
+explicitly requested, only the designated scheduler host should configure it.
+Windows Task Scheduler must use **Run only when user is logged on**, keep
 the session interactive, and prevent a second instance. The CLI mutex provides
 an additional overlap guard.
 
