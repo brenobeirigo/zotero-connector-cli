@@ -7,6 +7,8 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
+from pywinauto import Desktop
+
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -203,6 +205,64 @@ def activate_window(window: Window) -> None:
 def close_window(window: Window) -> None:
     if not user32.PostMessageW(window.hwnd, WM_CLOSE, 0, 0):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def browser_document_state(window: Window) -> dict:
+    """Return bounded UI Automation evidence about browser document loading."""
+    try:
+        wrapper = Desktop(backend="uia").window(handle=window.hwnd)
+        controls = wrapper.descendants()
+    except Exception as exc:
+        return {
+            "observable": False,
+            "complete": None,
+            "documentName": "",
+            "error": str(exc),
+        }
+
+    document_names = []
+    control_names = []
+    for control in controls:
+        try:
+            info = control.element_info
+            name = (info.name or "").strip()
+            control_type = info.control_type
+        except Exception:
+            continue
+        if name:
+            control_names.append(name.casefold())
+        if control_type == "Document" and name:
+            document_names.append(name)
+
+    loading_markers = (
+        "stop loading",
+        "stop loading this page",
+        "stop refreshing",
+    )
+    ready_markers = (
+        "reload",
+        "reload this page",
+        "refresh",
+    )
+    loading = any(name in loading_markers for name in control_names)
+    ready_control = next(
+        (
+            name
+            for name in control_names
+            if name in ready_markers
+        ),
+        "",
+    )
+    observable = bool(document_names and (loading or ready_control))
+    return {
+        "observable": observable,
+        "complete": bool(document_names and ready_control and not loading)
+        if observable
+        else None,
+        "documentName": document_names[0] if document_names else "",
+        "loadingIndicator": loading,
+        "readyIndicator": ready_control,
+    }
 
 
 def _keyboard_input(vk: int, key_up: bool = False) -> INPUT:

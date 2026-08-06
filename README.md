@@ -8,6 +8,13 @@ communication with Zotero Desktop.
 
 The CLI never reads browser cookies, profiles, passwords, or extension storage.
 
+> [!IMPORTANT]
+> This is an experimental Windows tool. Write-capable commands currently
+> require a companion Zotero CLI Bridge that exposes a local-only evaluation
+> endpoint. The bridge is installed in the author's environment but is not yet
+> distributed from this repository. See [TODO.md](TODO.md) before treating the
+> package as a turnkey installation.
+
 Automated agents should follow [AGENTS.md](AGENTS.md), which documents project
 CSV schemas, preconditions, batch/resume commands, exit-code handling, durable
 reports, authentication handoffs, and Zotero safety invariants.
@@ -20,11 +27,14 @@ reports, authentication handoffs, and Zotero safety invariants.
 - Zotero Connector installed in Edge, Brave, Chrome, or Firefox
 - `Ctrl+Shift+S` assigned to the Connector's **Save to Zotero** action
 - Any institutional proxy configured in the Connector
+- Companion Zotero CLI Bridge for commands that modify the library
 
 ## Install
 
 ```powershell
-python -m pip install -e C:\dev\repos\app\zotero-connector-cli
+git clone https://github.com/brenobeirigo/zotero-connector-cli.git
+cd zotero-connector-cli
+python -m pip install -e .
 ```
 
 ## Usage
@@ -47,7 +57,7 @@ Open a URL in Edge and add its PDF to that same existing item:
 zotero-connector save `
   --browser edge `
   --parent-key 4JZVYAIP `
-  --url "https://www-sciencedirect-com.ezproxy2.utwente.nl/science/article/pii/S0038012119304963"
+  --url "https://publisher.example.edu/article/10.0000/example"
 ```
 
 The temporary article tab is closed after reconciliation so batch runs do not
@@ -66,8 +76,31 @@ existing item, without creating a temporary bibliographic record:
 ```powershell
 zotero-connector attach-file `
   --parent-key UZVUC4HT `
-  --file "C:\Users\breno\Downloads\EBSCO-FullText-07_31_2026.pdf"
+  --file "C:\path\to\downloaded-paper.pdf"
 ```
+
+Import BibTeX stream files into one existing project collection without a
+Zotero Web API key:
+
+```powershell
+zotero-connector import-bib `
+  --bib-dir "C:\path\to\bib-streams" `
+  --parent-name "2026_paper_example"
+
+zotero-connector import-bib `
+  --bib-dir "C:\path\to\bib-streams" `
+  --parent-name "2026_paper_example" `
+  --apply
+```
+
+The first command is a dry run. The second creates any missing one-level
+subcollections named after the `.bib` files, matches existing items globally
+by DOI or normalized title/year, adds canonical records instead of importing
+duplicates, and creates only genuinely absent records. If a canonical item is
+already in another leaf of the same project, its existing placement is
+preserved and reported instead of giving it two project-stream memberships.
+The command uses the local Zotero CLI Bridge and therefore needs neither a
+model nor `ZOTERO_API_KEY`.
 
 Run an entire project status CSV locally, with no model or API service:
 
@@ -87,6 +120,9 @@ resume without redoing completed items. The runner also:
 - prevents overlapping runs against the same CSV with a crash-safe Windows
   named mutex;
 - isolates timeouts and transient failures to one row and continues;
+- reconciles an exact DOI/title Connector save after a transient Zotero bridge
+  outage before retrying, preventing hidden successful saves from becoming
+  active duplicates;
 - writes an atomic `*.zotero-connector-report.json` checkpoint after every row;
 - appends every start, item result, and finish to
   `*.zotero-connector-runs.jsonl`;
@@ -123,7 +159,7 @@ already running; the CLI mutex independently enforces the same rule.
 Anti-bot (`Just a moment...`), human-verification, sign-in, login, access-denied,
 and similar interstitial titles are reported as `interactive-required`. Their
 isolated windows are closed before the batch continues, and the final report's
-`interactiveRequired` count tells an agent when Breno needs a later login
+`interactiveRequired` count tells an agent when the user needs a later login
 handoff.
 
 The standard batch also includes an automatic University of Twente EBSCO
@@ -135,6 +171,35 @@ and invokes Zotero Connector there. It uses the signed-in Edge session without
 reading cookies, uses no model or screen coordinates, attaches only to the
 canonical parent, preserves collections, and closes the exact browser window.
 Use `--skip-ebsco` only when diagnosing this route.
+
+For a lawful source that is reachable from another Tailscale machine, add an
+explicit `remote_url` column and enable the serial SSH fallback:
+
+```powershell
+zotero-connector batch-csv `
+  --csv "C:\path\to\pdf-status.csv" `
+  --browser edge `
+  --remote-host "user@remote-host" `
+  --update-csv
+```
+
+The local/native, publisher, and EBSCO routes remain first. After a clean miss,
+the runner asks the configured remote host to download that row's HTTPS
+`remote_url` into a
+random `/tmp` file, copies it back over SCP, removes the remote temporary file,
+and verifies the local PDF signature, SHA-256, page readability, and DOI/title
+identity before attaching it to the existing Zotero parent. Transfers are
+serial and use OpenSSH batch mode, so the command remains standalone and needs
+no model monitoring. Successful staging copies are removed only after their
+hash matches the canonical attachment; mismatches remain staged beside the CSV
+for review. The report records the host, source URL, checksum, validation, and
+attachment result.
+
+`remote_url` must be an explicit lawful open-access, institutional, publisher,
+repository, or user-authorized direct PDF URL. The fallback does not search
+remote catalogues, reuse browser credentials, or automate unauthorized-copy
+services; known piracy domains are rejected. SSH keys and Tailscale access stay
+machine-local and are never written to the project CSV or report.
 
 For that handoff, process the whole review queue with no model monitoring:
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from pypdf import PdfReader
 
 from . import __version__
+from .bib_import import import_bib_directory
 from .ebsco import activate_pdf_access, build_ebsco_search_url
 from .privileged import (
     ZoteroBridgeError,
@@ -29,9 +30,17 @@ from .privileged import (
     parent_info,
     sync_library,
 )
+from .remote_fetch import (
+    RemoteFetchError,
+    fetch_pdf_over_ssh,
+    public_remote_url,
+    probe_remote_host,
+    validate_remote_url,
+)
 from .windows import (
     Window,
     activate_window,
+    browser_document_state,
     close_window,
     find_browser_executable,
     find_browser_window,
@@ -39,7 +48,7 @@ from .windows import (
     list_windows,
     send_ctrl_shift_s,
 )
-from .zotero import ZoteroUnavailable, ping, state, wait_for_changes
+from .zotero import ZoteroUnavailable, changed_items, ping, state, wait_for_changes
 
 
 BROWSER_PROCESSES = {
@@ -146,6 +155,93 @@ def _close_temporary_browser_window(window: Window, timeout: float = 10.0) -> No
     raise RuntimeError(
         f"Temporary browser window {window.hwnd} did not close within {timeout} seconds"
     )
+
+
+def _wait_for_browser_page_ready(
+    window: Window,
+    timeout: float,
+    *,
+    previous_title: str | None = None,
+    stable_seconds: float = 2.0,
+    poll_seconds: float = 0.25,
+) -> tuple[Window, dict]:
+    """Wait for a complete browser document or conservatively use the full timeout."""
+    started = time.monotonic()
+    deadline = started + max(0.0, timeout)
+    last_signature = None
+    stable_since = started
+    last_window = window
+    last_state = {
+        "observable": False,
+        "complete": None,
+        "documentName": "",
+    }
+    previous = (previous_title or "").strip().casefold()
+    placeholder_titles = {"", "new tab", "about:blank", "loading..."}
+
+    while True:
+        now = time.monotonic()
+        current_window = next(
+            (
+                candidate
+                for candidate in list_windows()
+                if candidate.hwnd == window.hwnd
+            ),
+            None,
+        )
+        if current_window is None:
+            if now >= deadline:
+                raise RuntimeError(
+                    "Browser window disappeared before the page became ready"
+                )
+            time.sleep(max(0.0, poll_seconds))
+            continue
+        last_window = current_window
+        title = last_window.title.strip()
+        normalized_title = title.casefold()
+        last_state = browser_document_state(last_window)
+        signature = (
+            normalized_title,
+            last_state.get("documentName", "").strip().casefold(),
+            last_state.get("complete"),
+        )
+        if signature != last_signature:
+            last_signature = signature
+            stable_since = now
+
+        title_ready = (
+            normalized_title not in placeholder_titles
+            and not normalized_title.startswith("loading")
+            and "about:blank" not in normalized_title
+            and (not previous or normalized_title != previous)
+        )
+        stable = now - stable_since >= min(max(0.0, stable_seconds), timeout)
+        if title_ready and last_state.get("complete") is True and stable:
+            return last_window, {
+                **last_state,
+                "mode": "uia-document-ready",
+                "windowTitle": title,
+                "elapsedSeconds": round(now - started, 3),
+            }
+
+        if now >= deadline:
+            if title_ready and last_state.get("complete") is not False:
+                return last_window, {
+                    **last_state,
+                    "mode": "conservative-timeout",
+                    "windowTitle": title,
+                    "elapsedSeconds": round(now - started, 3),
+                }
+            if last_state.get("complete") is False:
+                raise RuntimeError(
+                    "Browser document was still loading after "
+                    f"{timeout:g} seconds (last title: {title!r})"
+                )
+            raise RuntimeError(
+                "Browser page did not reach a usable document title within "
+                f"{timeout:g} seconds (last title: {title!r})"
+            )
+        time.sleep(max(0.0, poll_seconds))
 
 
 def _summarize_item(item: dict) -> dict:
@@ -276,6 +372,32 @@ def command_attach_file(args: argparse.Namespace) -> int:
     else:
         print(
             f"Zotero did not finish attaching the PDF to {result['parentKey']}.",
+            file=sys.stderr,
+        )
+    return 0 if result["ok"] else 5
+
+
+def command_import_bib(args: argparse.Namespace) -> int:
+    ping()
+    result = import_bib_directory(
+        args.bib_dir,
+        args.parent_name,
+        apply=args.apply,
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif result["ok"]:
+        mode = "Imported" if result["applied"] else "Dry run"
+        counts = result["counts"]
+        print(
+            f"{mode}: {result['parsed']} entries; {counts['create']} new, "
+            f"{counts['addExisting']} existing added, "
+            f"{counts['alreadyPresent']} already present, "
+            f"{counts['preservedElsewhere']} preserved in another project leaf."
+        )
+    else:
+        print(
+            f"Import blocked by {len(result.get('conflicts', []))} ambiguous match(es).",
             file=sys.stderr,
         )
     return 0 if result["ok"] else 5
@@ -536,6 +658,71 @@ def _child_route(child_result: dict) -> str:
     )
 
 
+def _normalized_bibliographic_title(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _clean_doi(value: str) -> str:
+    normalized = value.strip().casefold()
+    normalized = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", normalized)
+    return normalized.removeprefix("doi:").strip()
+
+
+def _matching_changed_parent_keys(
+    changed: list[dict],
+    parent_key: str,
+    row: dict,
+    args: argparse.Namespace,
+) -> list[str]:
+    target_doi = _clean_doi(row.get(args.doi_column, ""))
+    target_title = _normalized_bibliographic_title(
+        row.get(args.title_column, "")
+    )
+    matches: list[str] = []
+    for item in changed:
+        data = item.get("data", {})
+        key = item.get("key", "")
+        if not key or key == parent_key or data.get("parentItem"):
+            continue
+        if data.get("itemType") == "attachment":
+            continue
+        doi_match = bool(target_doi) and _clean_doi(data.get("DOI", "")) == target_doi
+        title_match = bool(target_title) and _normalized_bibliographic_title(
+            data.get("title", "")
+        ) == target_title
+        if doi_match or title_match:
+            matches.append(key)
+    return list(dict.fromkeys(matches))
+
+
+def _recover_interrupted_connector_save(
+    parent_key: str,
+    before,
+    row: dict,
+    args: argparse.Namespace,
+) -> dict | None:
+    after = state()
+    if after.version <= before.version:
+        return None
+    changed = changed_items(before.version)
+    candidates = _matching_changed_parent_keys(changed, parent_key, row, args)
+    if not candidates:
+        return None
+    adoption = adopt_connector_pdf(parent_key, candidates)
+    result = {
+        "ok": bool(adoption.get("ok")),
+        "route": "connector-recovery",
+        "parentKey": parent_key,
+        "beforeVersion": before.version,
+        "afterVersion": after.version,
+        "candidateKeys": candidates,
+        "adoption": adoption,
+    }
+    if result["ok"] or adoption.get("duplicateTrashed"):
+        result["sync"] = sync_library()
+    return result
+
+
 def _prefers_ebsco(url: str, row: dict, doi_column: str) -> bool:
     doi = row.get(doi_column, "").strip().casefold()
     normalized_url = url.casefold()
@@ -626,8 +813,8 @@ def _batch_retrieval_attempt(
             title=title,
             args=args,
         )
-        ebsco_result["publisherAttempt"] = publisher_result
         if ebsco_code in (0, 8, 9):
+            ebsco_result["publisherAttempt"] = publisher_result
             return ebsco_code, ebsco_result
         publisher_result["ebscoAttempt"] = ebsco_result
         return publisher_code, publisher_result
@@ -772,6 +959,99 @@ def _interactive_download_attempt(
     return exit_code, result
 
 
+def _remote_download_attempt(
+    parent_key: str,
+    remote_url: str,
+    title: str,
+    doi: str,
+    args: argparse.Namespace,
+) -> tuple[int, dict]:
+    reported_url = public_remote_url(remote_url)
+    staging_dir = Path(args.remote_staging_dir).expanduser().resolve()
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged = staging_dir / (
+        f"{parent_key.casefold()}--remote-{uuid.uuid4().hex[:12]}.pdf"
+    )
+    try:
+        transfer = fetch_pdf_over_ssh(
+            args.remote_host,
+            remote_url,
+            staged,
+            timeout=args.remote_timeout,
+            connect_timeout=args.remote_connect_timeout,
+        )
+    except RemoteFetchError as exc:
+        return 5, {
+            "ok": False,
+            "route": "remote-fetch-error",
+            "parentKey": parent_key,
+            "remoteHost": args.remote_host,
+            "remoteUrl": reported_url,
+            "error": str(exc),
+        }
+
+    validation = _validate_pdf_identity(staged, title=title, doi=doi)
+    if not validation["ok"]:
+        return 4, {
+            "ok": False,
+            "route": "remote-identity-mismatch",
+            "parentKey": parent_key,
+            "remoteHost": args.remote_host,
+            "remoteUrl": reported_url,
+            "staged": str(staged),
+            "sha256": transfer["sha256"],
+            "validation": validation,
+        }
+
+    attachment = attach_pdf_file(
+        parent_key,
+        str(staged),
+        wait_seconds=args.native_wait,
+    )
+    if not attachment["ok"]:
+        return 5, {
+            "ok": False,
+            "route": "remote-attach-error",
+            "parentKey": parent_key,
+            "remoteHost": args.remote_host,
+            "remoteUrl": reported_url,
+            "staged": str(staged),
+            "sha256": transfer["sha256"],
+            "validation": validation,
+            "attachment": attachment,
+        }
+
+    attachment["sync"] = sync_library()
+    staging_removed = False
+    attachment_paths = [
+        Path(item["path"])
+        for item in attachment.get("attachments", [])
+        if item.get("exists") and item.get("path")
+    ]
+    if attachment_paths:
+        canonical_path = attachment_paths[0].resolve()
+        canonical_sha = _file_sha256(canonical_path)
+        if (
+            canonical_sha == transfer["sha256"]
+            and canonical_path != staged.resolve()
+            and staged.exists()
+        ):
+            staged.unlink()
+            staging_removed = True
+    return 0, {
+        "ok": True,
+        "route": "remote-ssh-attach",
+        "parentKey": parent_key,
+        "remoteHost": args.remote_host,
+        "remoteUrl": reported_url,
+        "staged": str(staged),
+        "stagingRemoved": staging_removed,
+        "sha256": transfer["sha256"],
+        "validation": validation,
+        "attachment": attachment,
+    }
+
+
 def command_batch_csv(args: argparse.Namespace) -> int:
     csv_path = Path(args.csv).expanduser().resolve()
     if not csv_path.is_file():
@@ -788,6 +1068,8 @@ def command_batch_csv(args: argparse.Namespace) -> int:
         args.interactive_wait,
         args.ebsco_load_wait,
         args.ebsco_tab_wait,
+        args.remote_timeout,
+        args.remote_connect_timeout,
     ) < 0:
         raise RuntimeError("batch timing options must be zero or greater")
     if args.ebsco_max_tabs <= 0:
@@ -832,6 +1114,11 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 f"CSV has no {args.policy_column!r} column required by "
                 "--policy-value"
             )
+        if args.remote_host and args.remote_url_column not in fieldnames:
+            raise RuntimeError(
+                f"CSV has no {args.remote_url_column!r} column required by "
+                "--remote-host"
+            )
 
         selected = [
             row
@@ -845,6 +1132,20 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 for row in selected
                 if row.get(args.policy_column, "") == args.policy_value
             ]
+        remote_rows = [
+            row for row in selected if row.get(args.remote_url_column, "").strip()
+        ] if args.remote_host else []
+        for row in remote_rows:
+            validate_remote_url(row[args.remote_url_column])
+        if remote_rows:
+            probe_remote_host(
+                args.remote_host,
+                connect_timeout=args.remote_connect_timeout,
+            )
+        if not args.remote_staging_dir:
+            args.remote_staging_dir = str(
+                csv_path.parent / ".zotero-connector-staging"
+            )
         results = []
         started_at = _timestamp()
 
@@ -929,13 +1230,31 @@ def command_batch_csv(args: argparse.Namespace) -> int:
             for attempt in range(1, max_attempts + 1):
                 if args.reconcile_only:
                     break
+                attempt_before = None
                 try:
+                    attempt_before = state()
                     exit_code, child_result = _batch_retrieval_attempt(
                         parent_key,
                         url,
                         row,
                         args,
                     )
+                    remote_url = row.get(args.remote_url_column, "").strip()
+                    if (
+                        exit_code not in (0, 8)
+                        and not args.interactive_downloads
+                        and args.remote_host
+                        and remote_url
+                    ):
+                        local_result = child_result
+                        exit_code, child_result = _remote_download_attempt(
+                            parent_key=parent_key,
+                            remote_url=remote_url,
+                            title=row.get(args.title_column, "").strip(),
+                            doi=row.get(args.doi_column, "").strip(),
+                            args=args,
+                        )
+                        child_result["localAttempt"] = local_result
                     attempts.append(
                         {
                             "attempt": attempt,
@@ -958,6 +1277,22 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                             "result": child_result,
                         }
                     )
+                    if attempt_before is not None:
+                        try:
+                            time.sleep(args.retry_delay)
+                            recovery = _recover_interrupted_connector_save(
+                                parent_key,
+                                attempt_before,
+                                row,
+                                args,
+                            )
+                        except (RuntimeError, ZoteroUnavailable, ZoteroBridgeError):
+                            recovery = None
+                        if recovery is not None:
+                            attempts[-1]["recovery"] = recovery
+                            child_result = recovery
+                            if recovery["ok"]:
+                                break
                 if attempt < max_attempts:
                     time.sleep(args.retry_delay)
 
@@ -1178,14 +1513,9 @@ def _execute_ebsco_pdf(
     exit_code = 4
     try:
         temporary_window = _open_url(browser, search_url)
-        time.sleep(args.ebsco_load_wait)
-        window = next(
-            (
-                candidate
-                for candidate in list_windows()
-                if candidate.hwnd == temporary_window.hwnd
-            ),
+        window, search_readiness = _wait_for_browser_page_ready(
             temporary_window,
+            timeout=args.ebsco_load_wait,
         )
         block_reason = _interactive_block_reason(window.title)
         if block_reason:
@@ -1219,31 +1549,23 @@ def _execute_ebsco_pdf(
                     "sourceRoute": "ebsco-search",
                 }
             else:
-                deadline = time.monotonic() + args.ebsco_load_wait
-                viewer = window
-                while time.monotonic() < deadline:
-                    viewer = next(
-                        (
-                            candidate
-                            for candidate in list_windows()
-                            if candidate.hwnd == temporary_window.hwnd
-                        ),
-                        viewer,
+                try:
+                    viewer, viewer_readiness = _wait_for_browser_page_ready(
+                        window,
+                        timeout=args.ebsco_load_wait,
+                        previous_title=window.title,
                     )
-                    normalized_title = viewer.title.casefold()
-                    if "ebsco" in normalized_title and "search results" not in normalized_title:
-                        break
-                    time.sleep(0.2)
-                else:
+                except RuntimeError:
                     result = {
                         "ok": False,
                         "route": "ebsco-viewer-timeout",
                         "parentKey": parent_key,
                         "browser": browser,
-                        "windowTitle": viewer.title,
+                        "windowTitle": window.title,
                         "url": search_url,
                         "sourceRoute": "ebsco-access-pdf",
                         "ebscoAccess": access,
+                        "searchReadiness": search_readiness,
                     }
                     exit_code = 5
 
@@ -1259,6 +1581,8 @@ def _execute_ebsco_pdf(
                     result["sourceRoute"] = "ebsco-access-pdf"
                     result["ebscoAccess"] = access
                     result["ebscoSearchUrl"] = search_url
+                    result["searchReadiness"] = search_readiness
+                    result["pageReadiness"] = viewer_readiness
                     exit_code = 0 if result["ok"] else 3
     finally:
         if temporary_window:
@@ -1307,14 +1631,9 @@ def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
     try:
         if open_url:
             temporary_window = _open_url(browser, args.url)
-            time.sleep(args.load_wait)
-            window = next(
-                (
-                    candidate
-                    for candidate in list_windows()
-                    if candidate.hwnd == temporary_window.hwnd
-                ),
+            window, page_readiness = _wait_for_browser_page_ready(
                 temporary_window,
+                timeout=args.load_wait,
             )
             if (
                 args.title_contains
@@ -1350,6 +1669,8 @@ def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
                 timeout=args.timeout,
                 settle=args.settle,
             )
+            if open_url:
+                result["pageReadiness"] = page_readiness
     finally:
         if open_url and temporary_window and not args.keep_tab:
             try:
@@ -1439,8 +1760,11 @@ def _add_save_options(parser: argparse.ArgumentParser, include_url: bool) -> Non
         parser.add_argument(
             "--load-wait",
             type=float,
-            default=8.0,
-            help="seconds to wait after opening the URL",
+            default=20.0,
+            help=(
+                "maximum seconds to wait for browser document readiness; "
+                "used as a conservative full wait when readiness is not observable"
+            ),
         )
     parser.add_argument(
         "--title-contains",
@@ -1515,6 +1839,20 @@ def build_parser() -> argparse.ArgumentParser:
     attach_file.add_argument("--json", action="store_true", help="emit JSON")
     attach_file.set_defaults(func=command_attach_file)
 
+    import_bib = subparsers.add_parser(
+        "import-bib",
+        help="import BibTeX streams through the local Zotero bridge without duplicates",
+    )
+    import_bib.add_argument("--bib-dir", required=True, help="directory of .bib stream files")
+    import_bib.add_argument("--parent-name", required=True, help="existing Zotero project collection")
+    import_bib.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply the globally deduplicated import (default is a dry run)",
+    )
+    import_bib.add_argument("--json", action="store_true", help="emit JSON")
+    import_bib.set_defaults(func=command_import_bib)
+
     batch_csv = subparsers.add_parser(
         "batch-csv",
         help="process Zotero parent keys and access URLs from a CSV without a model",
@@ -1542,7 +1880,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_csv.add_argument("--retries", type=int, default=2)
     batch_csv.add_argument("--retry-delay", type=float, default=5.0)
     batch_csv.add_argument("--pause", type=float, default=2.0)
-    batch_csv.add_argument("--load-wait", type=float, default=12.0)
+    batch_csv.add_argument("--load-wait", type=float, default=30.0)
     batch_csv.add_argument("--timeout", type=float, default=100.0)
     batch_csv.add_argument("--settle", type=float, default=10.0)
     batch_csv.add_argument("--native-wait", type=float, default=8.0)
@@ -1554,8 +1892,11 @@ def build_parser() -> argparse.ArgumentParser:
     batch_csv.add_argument(
         "--ebsco-load-wait",
         type=float,
-        default=7.0,
-        help="seconds to allow EBSCO search results and the PDF viewer to load",
+        default=30.0,
+        help=(
+            "maximum seconds for each EBSCO search/viewer readiness gate; "
+            "used as a conservative full wait when readiness is not observable"
+        ),
     )
     batch_csv.add_argument(
         "--ebsco-max-tabs",
@@ -1589,6 +1930,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     batch_csv.add_argument("--title-column", default="title")
     batch_csv.add_argument("--doi-column", default="doi")
+    batch_csv.add_argument(
+        "--remote-host",
+        default="",
+        help=(
+            "optional SSH fallback host for explicit lawful/open-access "
+            "remote_url values"
+        ),
+    )
+    batch_csv.add_argument("--remote-url-column", default="remote_url")
+    batch_csv.add_argument(
+        "--remote-staging-dir",
+        help="local staging directory (default: beside the project CSV)",
+    )
+    batch_csv.add_argument("--remote-timeout", type=float, default=180.0)
+    batch_csv.add_argument("--remote-connect-timeout", type=float, default=10.0)
     batch_csv.add_argument(
         "--report-file",
         help="durable atomic JSON checkpoint (default: beside the CSV)",
