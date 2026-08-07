@@ -79,6 +79,13 @@ zotero-connector attach-file `
   --file "C:\path\to\downloaded-paper.pdf"
 ```
 
+When Zotero has a relative linked-attachment base directory configured, place
+the verified PDF inside that directory before calling `attach-file`. The CLI
+creates a linked attachment and refuses to import the file into Zotero's
+internal storage. If the parent has exactly one broken, unannotated linked-PDF
+record, the command relinks that record in place and preserves its attachment
+key. Annotated broken records are never selected automatically.
+
 Import BibTeX stream files into one existing project collection without a
 Zotero Web API key:
 
@@ -243,26 +250,33 @@ items changed after the shortcut was sent.
 
 The default save sequence is:
 
-1. Refuse to continue if the canonical item already has a PDF.
+1. Refuse to continue if the canonical item already has a physically existing
+   PDF; broken attachment records do not count as available files.
 2. Try Zotero's native **Find Available PDF**, which attaches directly to the
    existing item.
 3. If that fails, invoke the browser Connector in the authenticated tab.
 4. Require exactly one new bibliographic item matching the canonical item's DOI
    or normalized title and year.
-5. Validate the new child PDF, move only that PDF to the canonical item, and
-   move the temporary bibliographic duplicate to Zotero Trash.
+5. Validate the new child PDF, move only that PDF to the canonical item,
+   externalize a new unannotated stored PDF into Zotero's configured linked
+   base directory, remove the verified internal stored copy, discard newly
+   created unannotated non-PDF file attachments, and move the temporary
+   bibliographic duplicate to Zotero Trash.
 6. Run Zotero data sync and report the final attachment key and linked path.
 
 No active duplicate remains after a successful save. The temporary item stays
 recoverable in Zotero Trash.
 
-Connector snapshots, HTML captures, supplementary files, and other non-PDF
-children are never moved to the canonical item. They remain under the temporary
-duplicate in Zotero Trash. The canonical parent's collection memberships are
-captured before adoption and must be exactly unchanged afterward. Since Zotero
-child attachments follow their parent item, the adopted PDF therefore appears
-in the canonical item's existing project stream rather than the Connector's
-currently selected collection.
+Connector snapshots, HTML captures, and other non-PDF file children are never
+moved to the canonical item. After an exact PDF adoption, newly created,
+unannotated non-PDF file children of that exact temporary duplicate are
+permanently discarded. This makes the successful Connector path PDF-only.
+Non-file metadata remains on the temporary duplicate in Zotero Trash. The
+canonical parent's collection memberships are captured before adoption and
+must be exactly unchanged afterward. Since Zotero child attachments follow
+their parent item, the adopted PDF therefore appears in the canonical item's
+existing project stream rather than the Connector's currently selected
+collection.
 
 If the Connector saves only metadata and a snapshot, with no PDF, the CLI
 still moves that exact temporary duplicate and all of its children to Zotero
@@ -283,7 +297,11 @@ Trash and reports the mismatch instead of adopting anything.
   title/year match.
 - Moves only one verified, unannotated PDF and preserves the original item
   metadata, collections, tags, date added, and item key.
-- Never adopts Connector-created snapshots or other non-PDF children.
+- Never adopts Connector-created snapshots or other non-PDF children; after a
+  successful PDF adoption it erases only unannotated non-PDF file children of
+  the exact temporary duplicate.
+- When linked attachments are configured, verifies the linked copy and removes
+  the Connector's internal stored PDF instead of leaving it in Zotero Trash.
 - Verifies that the canonical parent's collection IDs are unchanged after the
   PDF is adopted.
 - Moves the temporary duplicate to Zotero Trash rather than deleting it.

@@ -430,6 +430,54 @@ class CliTests(unittest.TestCase):
         self.assertEqual(connector.call_args.kwargs["window"], ready)
         self.assertEqual(result["pageReadiness"]["mode"], "uia-document-ready")
 
+    def test_publisher_save_does_not_count_broken_pdf_as_present(self) -> None:
+        opening = Window(2, 11, r"C:\Edge\msedge.exe", "A paper")
+        args = SimpleNamespace(
+            parent_key="ABCD1234",
+            skip_native=True,
+            browser="edge",
+            url="https://example.com/article",
+            load_wait=30,
+            title_contains=None,
+            timeout=100,
+            settle=10,
+            keep_tab=False,
+        )
+        broken = {
+            "key": "BROKEN01",
+            "isPDF": True,
+            "deleted": False,
+            "exists": False,
+        }
+        with (
+            patch("zotero_connector_cli.cli.ping"),
+            patch(
+                "zotero_connector_cli.cli.parent_info",
+                return_value={
+                    "key": "ABCD1234",
+                    "attachments": [broken],
+                    "collections": [],
+                },
+            ),
+            patch("zotero_connector_cli.cli._choose_browser", return_value="edge"),
+            patch("zotero_connector_cli.cli.state", return_value=SimpleNamespace()),
+            patch("zotero_connector_cli.cli._open_url", return_value=opening),
+            patch(
+                "zotero_connector_cli.cli._wait_for_browser_page_ready",
+                return_value=(opening, {"mode": "uia-document-ready"}),
+            ),
+            patch(
+                "zotero_connector_cli.cli._invoke_connector",
+                return_value={"ok": False, "route": "connector-no-changes"},
+            ) as connector,
+            patch("zotero_connector_cli.cli._close_temporary_browser_window"),
+        ):
+            code, result = _execute_save(args, open_url=True)
+
+        self.assertEqual(code, 3)
+        self.assertEqual(result["route"], "connector-no-changes")
+        connector.assert_called_once()
+
     @patch("zotero_connector_cli.cli._execute_save")
     def test_batch_attempt_uses_internal_serial_save(self, execute: Mock) -> None:
         execute.return_value = (3, {"ok": False, "route": "connector-no-changes"})
@@ -703,6 +751,62 @@ class CliTests(unittest.TestCase):
             settle=10,
         )
         code, result = _execute_ebsco_pdf("ABCD1234", "A paper", args)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["sourceRoute"], "ebsco-access-pdf")
+        invoke.assert_called_once()
+        close.assert_called_once_with(search)
+
+    @patch("zotero_connector_cli.cli._close_temporary_browser_window")
+    @patch("zotero_connector_cli.cli._wait_for_browser_page_ready")
+    @patch("zotero_connector_cli.cli._invoke_connector")
+    @patch("zotero_connector_cli.cli.activate_pdf_access")
+    @patch("zotero_connector_cli.cli._open_url")
+    @patch("zotero_connector_cli.cli.state", return_value=SimpleNamespace())
+    @patch("zotero_connector_cli.cli.parent_info")
+    @patch("zotero_connector_cli.cli.ping")
+    def test_ebsco_does_not_count_broken_pdf_as_present(
+        self,
+        _ping: Mock,
+        parent: Mock,
+        _state: Mock,
+        open_url: Mock,
+        access: Mock,
+        invoke: Mock,
+        readiness: Mock,
+        close: Mock,
+    ) -> None:
+        search = Window(2, 11, r"C:\Edge\msedge.exe", "Search results - EBSCO")
+        viewer = Window(2, 11, r"C:\Edge\msedge.exe", "A paper - EBSCO")
+        parent.return_value = {
+            "key": "ABCD1234",
+            "attachments": [
+                {
+                    "key": "BROKEN01",
+                    "isPDF": True,
+                    "deleted": False,
+                    "exists": False,
+                }
+            ],
+            "collections": [],
+        }
+        open_url.return_value = search
+        readiness.side_effect = [
+            (search, {"mode": "uia-document-ready"}),
+            (viewer, {"mode": "uia-document-ready"}),
+        ]
+        access.return_value = {"tabIndex": 55, "controlType": "Button"}
+        invoke.return_value = {"ok": True, "route": "connector-adopt"}
+        args = SimpleNamespace(
+            browser="edge",
+            ebsco_load_wait=1,
+            ebsco_max_tabs=220,
+            ebsco_tab_wait=0.04,
+            timeout=100,
+            settle=10,
+        )
+
+        code, result = _execute_ebsco_pdf("ABCD1234", "A paper", args)
+
         self.assertEqual(code, 0)
         self.assertEqual(result["sourceRoute"], "ebsco-access-pdf")
         invoke.assert_called_once()
