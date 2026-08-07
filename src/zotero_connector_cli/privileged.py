@@ -107,9 +107,14 @@ const item = Zotero.Items.getByLibraryAndKey(Zotero.Libraries.userLibraryID, {ke
 if (!item) throw new Error("Parent item not found: " + {key});
 if (item.deleted) throw new Error("Parent item is in Zotero Trash");
 if (!item.isRegularItem()) throw new Error("Target is not a regular bibliographic item");
-const existingPDFs = item.getAttachments()
-    .map(id => Zotero.Items.get(id))
-    .filter(attachment => attachment.isPDFAttachment() && !attachment.deleted);
+const existingPDFs = [];
+const brokenPDFs = [];
+for (const id of item.getAttachments()) {{
+    const attachment = Zotero.Items.get(id);
+    if (!attachment.isPDFAttachment() || attachment.deleted) continue;
+    if (await attachment.fileExists()) existingPDFs.push(attachment);
+    else brokenPDFs.push(attachment);
+}}
 if (existingPDFs.length) {{
     return {{
         ok: true,
@@ -163,9 +168,14 @@ const item = Zotero.Items.getByLibraryAndKey(Zotero.Libraries.userLibraryID, {ke
 if (!item) throw new Error("Parent item not found: " + {key});
 if (item.deleted) throw new Error("Parent item is in Zotero Trash");
 if (!item.isRegularItem()) throw new Error("Target is not a regular bibliographic item");
-const existingPDFs = item.getAttachments()
-    .map(id => Zotero.Items.get(id))
-    .filter(attachment => attachment.isPDFAttachment() && !attachment.deleted);
+const existingPDFs = [];
+const brokenPDFs = [];
+for (const id of item.getAttachments()) {{
+    const attachment = Zotero.Items.get(id);
+    if (!attachment.isPDFAttachment() || attachment.deleted) continue;
+    if (await attachment.fileExists()) existingPDFs.push(attachment);
+    else brokenPDFs.push(attachment);
+}}
 if (existingPDFs.length) {{
     return {{
         ok: true,
@@ -179,10 +189,48 @@ const header = await IOUtils.read({path}, {{maxBytes: 5}});
 if (String.fromCharCode(...header) !== "%PDF-") {{
     throw new Error("Selected file is not a valid PDF");
 }}
-await Zotero.Attachments.importFromFile({{
-    file: {path},
-    parentItemID: item.id
-}});
+const configuredBase = Zotero.Prefs.get("baseAttachmentPath") || "";
+const saveRelative = Boolean(Zotero.Prefs.get("saveRelativeAttachmentPath"));
+const normalizedPath = PathUtils.normalize({path});
+const normalizedBase = configuredBase ? PathUtils.normalize(configuredBase) : "";
+const separator = normalizedBase.includes("\\\\") ? "\\\\" : "/";
+const insideConfiguredBase = normalizedBase && (
+    normalizedPath === normalizedBase
+    || normalizedPath.startsWith(normalizedBase + separator)
+);
+let attachmentMode;
+let reusedAttachmentKey = null;
+if (
+    saveRelative
+    && insideConfiguredBase
+    && brokenPDFs.length === 1
+    && brokenPDFs[0].attachmentLinkMode === Zotero.Attachments.LINK_MODE_LINKED_FILE
+    && brokenPDFs[0].getAnnotations().length === 0
+) {{
+    await brokenPDFs[0].relinkAttachmentFile(normalizedPath);
+    attachmentMode = "relinked-broken-file";
+    reusedAttachmentKey = brokenPDFs[0].key;
+}}
+else if (saveRelative && insideConfiguredBase) {{
+    await Zotero.Attachments.linkFromFile({{
+        file: normalizedPath,
+        parentItemID: item.id
+    }});
+    attachmentMode = "linked-file";
+}}
+else if (saveRelative && normalizedBase) {{
+    throw new Error(
+        "Refusing to import into Zotero storage while a linked attachment base "
+        + "directory is configured; place the PDF under " + normalizedBase
+    );
+}}
+else {{
+    await Zotero.Attachments.importFromFile({{
+        file: normalizedPath,
+        parentItemID: item.id
+    }});
+    attachmentMode = "stored-file";
+}}
 await Zotero.Promise.delay({wait_ms});
 const refreshed = Zotero.Items.getByLibraryAndKey(item.libraryID, item.key);
 const finalCollectionIDs = [...refreshed.getCollections()].sort((a, b) => a - b);
@@ -190,16 +238,19 @@ if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)
     throw new Error("Canonical parent collection memberships changed unexpectedly");
 }}
 const attachments = [];
+const brokenAttachments = [];
 for (const id of refreshed.getAttachments()) {{
     const attachment = Zotero.Items.get(id);
     if (!attachment.isPDFAttachment() || attachment.deleted) continue;
-    attachments.push({{
+    const record = {{
         key: attachment.key,
         linkMode: attachment.attachmentLinkMode,
         path: await attachment.getFilePathAsync(),
         exists: await attachment.fileExists(),
         annotations: attachment.getAnnotations().length
-    }});
+    }};
+    if (record.exists) attachments.push(record);
+    else brokenAttachments.push(record);
 }}
 const collections = finalCollectionIDs.map(id => {{
     const collection = Zotero.Collections.get(id);
@@ -210,6 +261,9 @@ return {{
     route: "attach-file",
     parentKey: refreshed.key,
     attachments,
+    brokenAttachments,
+    attachmentMode,
+    reusedAttachmentKey,
     collections,
     collectionMembershipsPreserved: true
 }};
@@ -248,9 +302,17 @@ const parentDOI = cleanDOI(parent);
 const parentTitle = normalizeTitle(parent.getField("title"));
 const parentYear = year(parent);
 const originalCollectionIDs = [...parent.getCollections()].sort((a, b) => a - b);
-const currentPDFs = parent.getAttachments()
-    .map(id => Zotero.Items.get(id))
-    .filter(attachment => attachment.isPDFAttachment() && !attachment.deleted);
+const currentPDFs = [];
+for (const id of parent.getAttachments()) {{
+    const attachment = Zotero.Items.get(id);
+    if (
+        attachment.isPDFAttachment()
+        && !attachment.deleted
+        && await attachment.fileExists()
+    ) {{
+        currentPDFs.push(attachment);
+    }}
+}}
 
 const candidateKeys = {candidates};
 const regularCandidates = [];
@@ -267,9 +329,17 @@ for (const key of candidateKeys) {{
         && parentTitle === normalizeTitle(candidate.getField("title"))
         && (!parentYear || !year(candidate) || parentYear === year(candidate));
     if (!doiMatch && !titleMatch) continue;
-    const pdfs = candidate.getAttachments()
-        .map(id => Zotero.Items.get(id))
-        .filter(attachment => attachment.isPDFAttachment() && !attachment.deleted);
+    const pdfs = [];
+    for (const id of candidate.getAttachments()) {{
+        const attachment = Zotero.Items.get(id);
+        if (
+            attachment.isPDFAttachment()
+            && !attachment.deleted
+            && await attachment.fileExists()
+        ) {{
+            pdfs.push(attachment);
+        }}
+    }}
     matches.push({{candidate, pdfs, doiMatch, titleMatch}});
 }}
 
@@ -436,6 +506,32 @@ if (attachment.getAnnotations().length) {{
     throw new Error("Refusing to move an unexpectedly annotated temporary attachment");
 }}
 
+// A Connector translator may save an HTML snapshot beside the requested PDF.
+// Record only unannotated, non-PDF file children of this exact temporary
+// duplicate. They can be erased after the PDF has been adopted and verified;
+// no pre-existing child of the canonical record is ever considered here.
+const temporaryNonPDFFiles = [];
+for (const id of duplicate.getAttachments(true)) {{
+    const child = Zotero.Items.get(id);
+    if (
+        child.id === attachment.id
+        || !child.isFileAttachment()
+        || child.isPDFAttachment()
+    ) {{
+        continue;
+    }}
+    if (child.getAnnotations().length) {{
+        throw new Error("Refusing to erase an annotated temporary non-PDF attachment");
+    }}
+    temporaryNonPDFFiles.push({{
+        item: child,
+        key: child.key,
+        title: child.getField("title"),
+        contentType: child.attachmentContentType,
+        linkMode: child.attachmentLinkMode
+    }});
+}}
+
 await Zotero.DB.executeTransaction(async () => {{
     attachment.parentID = parent.id;
     await attachment.save();
@@ -443,15 +539,82 @@ await Zotero.DB.executeTransaction(async () => {{
     await duplicate.save();
 }});
 
-const refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
-const refreshedDuplicate = Zotero.Items.getByLibraryAndKey(parent.libraryID, duplicate.key);
-const finalPDFs = refreshedParent.getAttachments()
-    .map(id => Zotero.Items.get(id))
-    .filter(current => current.isPDFAttachment() && !current.deleted);
+// Connector downloads normally begin as stored attachments. When Zotero is
+// configured for relative linked attachments, externalize this new,
+// unannotated PDF before reporting success so the CLI cannot silently violate
+// the user's attachment-storage boundary.
+let adoptedAttachment = Zotero.Items.get(attachment.id);
+const configuredBase = Zotero.Prefs.get("baseAttachmentPath") || "";
+const saveRelative = Boolean(Zotero.Prefs.get("saveRelativeAttachmentPath"));
+if (
+    configuredBase
+    && saveRelative
+    && adoptedAttachment.attachmentLinkMode !== Zotero.Attachments.LINK_MODE_LINKED_FILE
+) {{
+    const sourcePath = await adoptedAttachment.getFilePathAsync();
+    if (!sourcePath || !(await adoptedAttachment.fileExists())) {{
+        throw new Error("Adopted stored PDF cannot be externalized because its file is missing");
+    }}
+    const sourceName = PathUtils.filename(sourcePath);
+    let destinationPath = PathUtils.join(configuredBase, sourceName);
+    if (await IOUtils.exists(destinationPath)) {{
+        const dot = sourceName.lastIndexOf(".");
+        const stem = dot > 0 ? sourceName.slice(0, dot) : sourceName;
+        const extension = dot > 0 ? sourceName.slice(dot) : "";
+        destinationPath = PathUtils.join(
+            configuredBase,
+            stem + "--zotero-" + adoptedAttachment.key.toLowerCase() + extension
+        );
+    }}
+    await IOUtils.copy(sourcePath, destinationPath);
+    const sourceStat = await IOUtils.stat(sourcePath);
+    const destinationStat = await IOUtils.stat(destinationPath);
+    if (sourceStat.size !== destinationStat.size) {{
+        throw new Error("Externalized PDF size mismatch");
+    }}
+    const linked = await Zotero.Attachments.linkFromFile({{
+        file: destinationPath,
+        parentItemID: parent.id
+    }});
+    linked.setField("title", adoptedAttachment.getField("title"));
+    await linked.saveTx();
+    if (!(await linked.fileExists())) {{
+        throw new Error("Externalized linked PDF does not resolve to a local file");
+    }}
+    // The verified linked copy is now canonical. Permanently remove the
+    // Connector's stored copy so no PDF remains in Zotero internal storage.
+    await adoptedAttachment.eraseTx();
+    adoptedAttachment = linked;
+}}
+
+let refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
+const finalPDFs = [];
+for (const id of refreshedParent.getAttachments()) {{
+    const current = Zotero.Items.get(id);
+    if (
+        current.isPDFAttachment()
+        && !current.deleted
+        && await current.fileExists()
+    ) {{
+        finalPDFs.push(current);
+    }}
+}}
 if (finalPDFs.length !== 1) {{
     throw new Error("Expected exactly one final PDF on the canonical parent; found " + finalPDFs.length);
 }}
 const moved = finalPDFs[0];
+const discardedTemporaryFiles = [];
+for (const temporary of temporaryNonPDFFiles) {{
+    await temporary.item.eraseTx();
+    discardedTemporaryFiles.push({{
+        key: temporary.key,
+        title: temporary.title,
+        contentType: temporary.contentType,
+        linkMode: temporary.linkMode
+    }});
+}}
+refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
+const refreshedDuplicate = Zotero.Items.getByLibraryAndKey(parent.libraryID, duplicate.key);
 const finalCollectionIDs = [...refreshedParent.getCollections()].sort((a, b) => a - b);
 if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)) {{
     throw new Error("Canonical parent collection memberships changed unexpectedly");
@@ -482,6 +645,7 @@ return {{
     collections,
     collectionMembershipsPreserved:
         JSON.stringify(originalCollectionIDs) === JSON.stringify(finalCollectionIDs),
+    discardedTemporaryFiles,
     temporaryChildrenLeftInTrash,
     attachment: {{
         key: moved.key,

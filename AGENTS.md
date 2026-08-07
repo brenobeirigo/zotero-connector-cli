@@ -64,14 +64,28 @@ single explicit paper only. Multi-paper work must be one `batch-csv` run.
 ## What the runner guarantees
 
 - It first addresses the exact existing Zotero parent key.
+- Only a physically existing PDF satisfies an availability gate. A broken
+  attachment record must not produce `already-present` or block publisher and
+  EBSCO retrieval.
 - It tries native **Find Available PDF** before browser Connector unless
   `--skip-native` is supplied.
 - A Connector-created item must match the canonical DOI or normalized
   title/year.
 - Only one verified, unannotated PDF may move to the canonical item.
+- When relative linked attachments are configured, adopted Connector PDFs are
+  externalized into that base directory before success is reported. Direct
+  `attach-file` input must already be inside the configured base; the command
+  refuses to create a new internal stored attachment.
+- `attach-file` relinks an existing broken linked-PDF key only when it is the
+  sole broken PDF and has no annotations. Annotated broken attachments remain
+  protected.
 - The canonical item's collection memberships must remain unchanged.
-- Temporary bibliographic duplicates, snapshots, and non-PDF children remain
-  recoverable in Zotero Trash; they are not merged into the canonical record.
+- Temporary bibliographic duplicates remain recoverable in Zotero Trash. On a
+  successful exact PDF adoption, newly created unannotated snapshots and other
+  non-PDF file children of that temporary duplicate are permanently discarded;
+  they are never merged into the canonical record.
+- When linked attachments are configured, the verified linked PDF replaces and
+  permanently removes the Connector's temporary internal stored copy.
 - CSV successes are checkpointed atomically after every item.
 - A named mutex prevents concurrent batches against the same CSV on one
   machine.

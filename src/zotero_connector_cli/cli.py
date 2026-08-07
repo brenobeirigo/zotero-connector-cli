@@ -1493,7 +1493,9 @@ def _execute_ebsco_pdf(
     existing_pdfs = [
         attachment
         for attachment in canonical["attachments"]
-        if attachment["isPDF"] and not attachment["deleted"]
+        if attachment["isPDF"]
+        and not attachment["deleted"]
+        and attachment["exists"]
     ]
     if existing_pdfs:
         return 0, {
@@ -1605,7 +1607,9 @@ def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
     existing_pdfs = [
         attachment
         for attachment in canonical["attachments"]
-        if attachment["isPDF"] and not attachment["deleted"]
+        if attachment["isPDF"]
+        and not attachment["deleted"]
+        and attachment["exists"]
     ]
     if existing_pdfs:
         result = {
