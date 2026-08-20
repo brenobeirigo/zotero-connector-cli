@@ -22,9 +22,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      # zotero-core is not published to an index; locally it is an editable
-      # install from c:\devepospp\zotero-core, and here it comes
-      # straight from its repository.
+      # zotero-core is not published to an index. Locally it is an
+      # editable install from a sibling checkout; the runner has none,
+      # so it installs from the repository directly.
       - run: python -m pip install "zotero-core @ git+https://github.com/brenobeirigo/zotero-core.git@main"
       - run: python -m pip install -e .
       - run: python -m unittest discover -s tests -v
