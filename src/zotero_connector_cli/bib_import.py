@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import bibtexparser
+from bibtexparser.bparser import BibTexParser
 
 from .privileged import evaluate
 
@@ -18,7 +19,12 @@ TYPE_MAP = {
     "book": "book",
     "phdthesis": "thesis",
     "mastersthesis": "thesis",
+    "bachelorthesis": "thesis",
+    "thesis": "thesis",
     "techreport": "report",
+    "report": "report",
+    "online": "webpage",
+    "misc": "webpage",
 }
 
 
@@ -30,10 +36,21 @@ def _clean(value: str | None) -> str:
 
 def _authors(value: str | None) -> list[dict[str, str]]:
     creators: list[dict[str, str]] = []
-    for raw in re.split(r"\s+and\s+", _clean(value), flags=re.IGNORECASE):
+    for raw in re.split(r"\s+and\s+", value or "", flags=re.IGNORECASE):
         name = raw.strip()
         if not name:
             continue
+        if name.startswith("{") and name.endswith("}"):
+            creators.append(
+                {
+                    "creatorType": "author",
+                    "firstName": "",
+                    "lastName": _clean(name),
+                    "fieldMode": 1,
+                }
+            )
+            continue
+        name = _clean(name)
         if "," in name:
             last, first = (part.strip() for part in name.split(",", 1))
         else:
@@ -43,6 +60,18 @@ def _authors(value: str | None) -> list[dict[str, str]]:
     return creators
 
 
+def _first_creator_match(value: str | None) -> str:
+    first = re.split(r"\s+and\s+", value or "", maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    if not first:
+        return ""
+    if first.startswith("{") and first.endswith("}"):
+        return _clean(first)
+    first = _clean(first)
+    if "," in first:
+        return first.split(",", 1)[0].strip()
+    return first.split()[-1] if first.split() else ""
+
+
 def _entry_payload(entry: dict[str, str], stream: str) -> dict:
     entry_type = entry.get("ENTRYTYPE", "").casefold()
     item_type = TYPE_MAP.get(entry_type)
@@ -50,8 +79,9 @@ def _entry_payload(entry: dict[str, str], stream: str) -> dict:
         raise ValueError(f"unsupported BibTeX type {entry_type!r} for {entry.get('ID')!r}")
     title = _clean(entry.get("title"))
     year = _clean(entry.get("year"))
-    if not title or not year:
-        raise ValueError(f"BibTeX entry {entry.get('ID')!r} requires title and year")
+    if not title or (not year and item_type != "webpage"):
+        requirement = "title" if item_type == "webpage" else "title and year"
+        raise ValueError(f"BibTeX entry {entry.get('ID')!r} requires {requirement}")
 
     fields: dict[str, str] = {
         "title": title,
@@ -78,10 +108,25 @@ def _entry_payload(entry: dict[str, str], stream: str) -> dict:
         fields["proceedingsTitle"] = _clean(entry.get("booktitle"))
     elif item_type == "thesis":
         fields["university"] = _clean(entry.get("school"))
-        fields["thesisType"] = "PhD thesis" if entry_type == "phdthesis" else "Master's thesis"
+        if entry_type == "phdthesis":
+            thesis_type = "PhD thesis"
+        elif entry_type == "mastersthesis":
+            thesis_type = "Master's thesis"
+        elif entry_type == "bachelorthesis":
+            thesis_type = "Bachelor's thesis"
+        else:
+            thesis_type = _clean(entry.get("type")) or "Thesis"
+        fields["thesisType"] = thesis_type
     elif item_type == "report":
         fields["institution"] = _clean(entry.get("institution"))
         fields["reportNumber"] = _clean(entry.get("number"))
+    elif item_type == "webpage":
+        fields["websiteTitle"] = (
+            _clean(entry.get("organization"))
+            or _clean(entry.get("publisher"))
+            or _clean(entry.get("howpublished"))
+        )
+        fields["accessDate"] = _clean(entry.get("urldate"))
 
     return {
         "citationKey": _clean(entry.get("ID")),
@@ -90,6 +135,7 @@ def _entry_payload(entry: dict[str, str], stream: str) -> dict:
         "title": title,
         "year": year,
         "doi": _clean(entry.get("doi")),
+        "matchCreator": _first_creator_match(entry.get("author")),
         "fields": {key: value for key, value in fields.items() if value},
         "creators": _authors(entry.get("author")),
     }
@@ -105,10 +151,20 @@ def load_bib_directory(bib_dir: str | Path) -> list[dict]:
     if not files:
         raise ValueError(f"No .bib files found in {directory}")
     for path in files:
-        database = bibtexparser.loads(path.read_text(encoding="utf-8"))
+        parser = BibTexParser(common_strings=True)
+        parser.ignore_nonstandard_types = False
+        database = bibtexparser.loads(path.read_text(encoding="utf-8"), parser=parser)
         for entry in database.entries:
             item = _entry_payload(entry, path.stem)
-            identity = (item["doi"].casefold(), re.sub(r"\W+", "", item["title"].casefold()))
+            if item["doi"]:
+                identity = ("doi", item["doi"].casefold())
+            else:
+                identity = (
+                    "title-year-creator",
+                    re.sub(r"\W+", "", item["title"].casefold()),
+                    item["year"],
+                    re.sub(r"\W+", "", item["matchCreator"].casefold()),
+                )
             if identity in seen:
                 raise ValueError(f"duplicate staged work in {path.name}: {item['title']}")
             seen.add(identity)
@@ -166,11 +222,14 @@ const items = (await Zotero.Items.getAll(lib, true)).filter(
 );
 const byDOI = new Map();
 const byTitleYear = new Map();
+const byTitleYearCreator = new Map();
 for (const item of items) {{
     const doi = cleanDOI(item.getField("DOI") || item.getExtraField("DOI"));
     if (doi) byDOI.set(doi, [...(byDOI.get(doi) || []), item]);
     const key = normalize(item.getField("title")) + "|" + yearOf(item);
     if (key !== "|") byTitleYear.set(key, [...(byTitleYear.get(key) || []), item]);
+    const creatorKey = key + "|" + normalize(item.getField("firstCreator"));
+    if (key !== "|") byTitleYearCreator.set(creatorKey, [...(byTitleYearCreator.get(creatorKey) || []), item]);
 }}
 
 const streamNames = [...new Set(entries.map(entry => entry.stream))].sort();
@@ -187,7 +246,13 @@ for (const entry of entries) {{
     let matches = [];
     const doi = cleanDOI(entry.doi);
     if (doi) matches = byDOI.get(doi) || [];
-    if (!matches.length) matches = byTitleYear.get(normalize(entry.title) + "|" + entry.year) || [];
+    if (!matches.length && !doi) {{
+        const titleYear = normalize(entry.title) + "|" + entry.year;
+        const creator = normalize(entry.matchCreator);
+        matches = creator
+            ? (byTitleYearCreator.get(titleYear + "|" + creator) || [])
+            : (byTitleYear.get(titleYear) || []);
+    }}
     if (matches.length > 1) {{
         conflicts.push({{citationKey: entry.citationKey, title: entry.title, reason: "ambiguous-global-match", itemKeys: matches.map(item => item.key)}});
         continue;
