@@ -28,6 +28,66 @@ class BibImportTests(unittest.TestCase):
         self.assertEqual(entries[0]["fields"]["pages"], "146-154")
         self.assertEqual(entries[0]["creators"][0]["lastName"], "Savelsbergh")
 
+    def test_loads_webpage_and_generic_thesis_types(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "Company evidence.bib").write_text(
+                """@online{company2026,
+  title={Operations profile}, organization={Example Company}, year={2026},
+  url={https://example.com/operations}, urldate={2026-08-16}}
+@online{companyUndated,
+  title={Locations}, organization={Example Company},
+  url={https://example.com/locations}, urldate={2026-08-16}}
+@thesis{student2025,
+  author={Student, Sam}, title={Warehouse study}, school={University of Twente},
+  type={Bachelor's thesis}, year={2025}, url={https://essay.utwente.nl/example}}
+@bachelorthesis{student2024,
+  author={Student, Alex}, title={Production study}, school={University of Twente},
+  year={2024}, url={https://essay.utwente.nl/example-2}}
+@report{company2025,
+  title={Annual report}, institution={Example Company}, year={2025},
+  url={https://example.com/report}}
+""",
+                encoding="utf-8",
+            )
+            entries = load_bib_directory(directory)
+        by_key = {entry["citationKey"]: entry for entry in entries}
+        self.assertEqual(by_key["company2026"]["itemType"], "webpage")
+        self.assertEqual(
+            by_key["company2026"]["fields"]["websiteTitle"], "Example Company"
+        )
+        self.assertEqual(
+            by_key["company2026"]["fields"]["accessDate"], "2026-08-16"
+        )
+        self.assertEqual(by_key["companyUndated"]["itemType"], "webpage")
+        self.assertNotIn("date", by_key["companyUndated"]["fields"])
+        self.assertEqual(by_key["student2025"]["itemType"], "thesis")
+        self.assertEqual(
+            by_key["student2025"]["fields"]["thesisType"], "Bachelor's thesis"
+        )
+        self.assertEqual(
+            by_key["student2024"]["fields"]["thesisType"], "Bachelor's thesis"
+        )
+        self.assertEqual(by_key["company2025"]["itemType"], "report")
+
+    def test_distinguishes_generic_titles_by_corporate_creator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "Reports.bib").write_text(
+                """@report{asml2025,
+  author={{ASML Holding N.V.}}, title={Annual Report 2025},
+  institution={ASML Holding N.V.}, year={2026}}
+@report{vdl2025,
+  author={{VDL Groep}}, title={Annual Report 2025},
+  institution={VDL Groep}, year={2026}}
+""",
+                encoding="utf-8",
+            )
+            entries = load_bib_directory(directory)
+        by_key = {entry["citationKey"]: entry for entry in entries}
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(by_key["asml2025"]["matchCreator"], "ASML Holding N.V.")
+        self.assertEqual(by_key["vdl2025"]["matchCreator"], "VDL Groep")
+        self.assertEqual(by_key["vdl2025"]["creators"][0]["fieldMode"], 1)
+
     @patch("zotero_connector_cli.bib_import.evaluate")
     def test_dry_run_uses_local_bridge_and_does_not_apply(self, evaluate) -> None:
         evaluate.return_value = {"ok": True, "applied": False, "parsed": 1}
