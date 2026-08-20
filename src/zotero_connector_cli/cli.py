@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 
 from pypdf import PdfReader
+from zotero_core.hashing import file_sha256
+from zotero_core.identity import normalize_doi, normalize_title
 
 from . import __version__
 from .bib_import import import_bib_directory
@@ -403,14 +405,6 @@ def command_import_bib(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 5
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest().upper()
-
-
 def _identity_tokens(value: str) -> list[str]:
     stopwords = {
         "about",
@@ -658,24 +652,14 @@ def _child_route(child_result: dict) -> str:
     )
 
 
-def _normalized_bibliographic_title(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
-
-
-def _clean_doi(value: str) -> str:
-    normalized = value.strip().casefold()
-    normalized = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", normalized)
-    return normalized.removeprefix("doi:").strip()
-
-
 def _matching_changed_parent_keys(
     changed: list[dict],
     parent_key: str,
     row: dict,
     args: argparse.Namespace,
 ) -> list[str]:
-    target_doi = _clean_doi(row.get(args.doi_column, ""))
-    target_title = _normalized_bibliographic_title(
+    target_doi = normalize_doi(row.get(args.doi_column, ""))
+    target_title = normalize_title(
         row.get(args.title_column, "")
     )
     matches: list[str] = []
@@ -686,8 +670,8 @@ def _matching_changed_parent_keys(
             continue
         if data.get("itemType") == "attachment":
             continue
-        doi_match = bool(target_doi) and _clean_doi(data.get("DOI", "")) == target_doi
-        title_match = bool(target_title) and _normalized_bibliographic_title(
+        doi_match = bool(target_doi) and normalize_doi(data.get("DOI", "")) == target_doi
+        title_match = bool(target_title) and normalize_title(
             data.get("title", "")
         ) == target_title
         if doi_match or title_match:
@@ -1030,7 +1014,7 @@ def _remote_download_attempt(
     ]
     if attachment_paths:
         canonical_path = attachment_paths[0].resolve()
-        canonical_sha = _file_sha256(canonical_path)
+        canonical_sha = file_sha256(canonical_path, uppercase=True)
         if (
             canonical_sha == transfer["sha256"]
             and canonical_path != staged.resolve()
@@ -1367,7 +1351,7 @@ def command_batch_csv(args: argparse.Namespace) -> int:
                 attachment = final_pdfs[0]
                 path = Path(attachment["path"])
                 try:
-                    sha256 = _file_sha256(path)
+                    sha256 = file_sha256(path, uppercase=True)
                 except OSError as exc:
                     result["ok"] = False
                     result["route"] = "attachment-read-error"

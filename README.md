@@ -32,10 +32,17 @@ reports, authentication handoffs, and Zotero safety invariants.
 ## Install
 
 ```powershell
+git clone https://github.com/brenobeirigo/zotero-core.git
 git clone https://github.com/brenobeirigo/zotero-connector-cli.git
-cd zotero-connector-cli
-python -m pip install -e .
+python -m pip install -e .\zotero-core
+python -m pip install -e .\zotero-connector-cli
 ```
+
+BibTeX parsing, item typing, duplicate matching and import planning come from
+[zotero-core](https://github.com/brenobeirigo/zotero-core), which this package
+shares with the other tools that write to the same library. What lives here is
+the Windows side: browser Connector automation, PDF retrieval and its route
+cascade, and the resumable batch runner.
 
 ## Usage
 

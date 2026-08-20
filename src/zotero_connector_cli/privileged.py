@@ -1,51 +1,27 @@
 from __future__ import annotations
 
 import json
-import urllib.error
-import urllib.request
 
-from .zotero import CONNECTOR_BASE, ZoteroUnavailable
+from zotero_core.backends.desktop import bridge_ping, evaluate
+from zotero_core.errors import BridgeError, BridgeNotInstalled, ZoteroUnavailable
 
+# The bridge transport, its ping, and the error taxonomy are shared with every
+# other tool that writes to this library. Kept under the old names so the rest
+# of this package and its tests are unaffected.
+ZoteroBridgeError = BridgeError
 
-class ZoteroBridgeError(RuntimeError):
-    pass
-
-
-def evaluate(script: str, timeout: float = 120.0):
-    request = urllib.request.Request(
-        CONNECTOR_BASE + "/cli-bridge/eval",
-        data=script.encode("utf-8"),
-        headers={
-            "Content-Type": "text/plain",
-            "User-Agent": "zotero-connector-cli/0.1",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        try:
-            error = json.loads(body)
-        except json.JSONDecodeError:
-            error = {"error": body or str(exc)}
-        raise ZoteroBridgeError(error.get("error", str(exc))) from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise ZoteroUnavailable(
-            "Zotero CLI Bridge is not reachable at 127.0.0.1:23119"
-        ) from exc
-
-    if isinstance(payload, dict) and payload.get("error"):
-        raise ZoteroBridgeError(payload["error"])
-    return payload
-
-
-def bridge_ping() -> dict:
-    return evaluate(
-        'return {version: Zotero.version, libraryID: Zotero.Libraries.userLibraryID};',
-        timeout=10,
-    )
+__all__ = [
+    "BridgeNotInstalled",
+    "ZoteroBridgeError",
+    "ZoteroUnavailable",
+    "adopt_connector_pdf",
+    "attach_pdf_file",
+    "bridge_ping",
+    "evaluate",
+    "find_available_pdf",
+    "parent_info",
+    "sync_library",
+]
 
 
 def sync_library() -> dict:

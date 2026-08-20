@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import subprocess
 import uuid
 from pathlib import Path
+
+from zotero_core.hashing import file_sha256
 from urllib.parse import urlsplit
 
 
@@ -53,14 +54,6 @@ def validate_remote_url(url: str) -> str:
 def public_remote_url(url: str) -> str:
     parsed = urlsplit(validate_remote_url(url))
     return parsed._replace(query="", fragment="").geturl()
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest().upper()
 
 
 def _ssh_command(host: str, connect_timeout: float) -> list[str]:
@@ -193,7 +186,7 @@ def fetch_pdf_over_ssh(
             raise RemoteFetchError(copied.stderr.strip() or "SCP transfer failed")
         if not destination.is_file() or destination.read_bytes()[:5] != b"%PDF-":
             raise RemoteFetchError("transferred file is not a PDF")
-        local_sha = _sha256(destination)
+        local_sha = file_sha256(destination, uppercase=True)
         if local_sha != remote_result["sha256"]:
             raise RemoteFetchError("remote/local SHA-256 mismatch")
         return {

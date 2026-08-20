@@ -10,7 +10,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Breno Alves Beirigo" }]
-dependencies = ["bibtexparser>=1.4,<2", "pypdf>=5,<7", "pywinauto==0.6.9"]
+dependencies = [
+  "zotero-core>=0.1",
+  "bibtexparser>=1.4,<2",
+  "pypdf>=5,<7",
+  "pywinauto==0.6.9",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Win32 (MS Windows)",
@@ -28,6 +33,9 @@ classifiers = [
 Homepage = "https://github.com/brenobeirigo/zotero-connector-cli"
 Repository = "https://github.com/brenobeirigo/zotero-connector-cli"
 Issues = "https://github.com/brenobeirigo/zotero-connector-cli/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
 
 [project.scripts]
 zotero-connector = "zotero_connector_cli.cli:main"
