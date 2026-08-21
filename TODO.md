@@ -5,8 +5,11 @@ general use. Implemented behavior belongs in `README.md` and `AGENTS.md`.
 
 ## Release blockers
 
-- Define a versioning and release process: changelog, tagged GitHub releases,
-  built wheel/sdist, dependency audit, and optional PyPI publication.
+None outstanding. The bridge is identified and version-checked, the
+institutional route is configuration, the live profile exists, and a tag now
+means something specific -- see `RELEASING.md`. What remains below is work,
+not a barrier to cutting `v0.2.0`.
+
 
 ## Reliability and safety
 

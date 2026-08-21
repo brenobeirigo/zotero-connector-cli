@@ -33,7 +33,11 @@ jobs:
       - name: Resolve this package's dependencies into a clean environment
         run: |
           python -m venv .audit
-          PY=$(ls .audit/bin/python .audit/Scripts/python.exe 2>/dev/null | head -1)
+          # Not `ls a b | head -1`: ls exits non-zero when either path is
+          # missing, and the runner's shell uses -e -o pipefail, so the
+          # assignment itself would end the step.
+          PY=.audit/bin/python
+          [ -x "$PY" ] || PY=.audit/Scripts/python.exe
           "$PY" -m pip install --quiet --upgrade pip
           "$PY" -m pip install --quiet "zotero-core @ git+https://github.com/brenobeirigo/zotero-core.git@main" .
           "$PY" -m pip freeze --exclude-editable > audit-requirements.txt
