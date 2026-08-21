@@ -201,6 +201,67 @@ class MergeTests(LiveZoteroTestCase):
         self.assertEqual(len(live[survivor].collection_keys), 2)
 
 
+class LandingPageSweepTests(LiveZoteroTestCase):
+    """The litter that survived a real 2026-08-03 run, reproduced and cleaned."""
+
+    @requires_live
+    def test_saved_landing_pages_are_trashed_and_the_parent_is_untouched(self):
+        from zotero_connector_cli.privileged import adopt_connector_pdf
+
+        parent = self.make_item(
+            title="Live Harness Canonical Work",
+            date="2026",
+            DOI="10.5555/live-harness-landing",
+        )
+        # Two of them: the old cleanup only ever handled exactly one, which is
+        # how six of these accumulated in the real library.
+        pages = [
+            self.make_item(
+                item_type="webpage",
+                title="EBSCO",
+                url="https://research-ebsco-com.example.edu/c/x/viewer/pdf/abc123",
+            )
+            for _ in range(2)
+        ]
+
+        result = adopt_connector_pdf(parent, pages)
+
+        self.assertEqual(result["route"], "provider-landing-page")
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            sorted(page["key"] for page in result["landingPagesTrashed"]), sorted(pages)
+        )
+        self.assertTrue(result["collectionMembershipsPreserved"])
+
+        live = {item.key for item in DesktopBridgeBackend().snapshot_library()}
+        for page in pages:
+            self.assertNotIn(page, live)
+        self.assertIn(parent, live, "the canonical item must survive the sweep")
+
+    @requires_live
+    def test_a_candidate_carrying_a_real_pdf_is_not_swept_as_litter(self):
+        from zotero_connector_cli.privileged import adopt_connector_pdf
+
+        parent = self.make_item(
+            title="Live Harness Canonical Work Two",
+            date="2026",
+            DOI="10.5555/live-harness-keep",
+        )
+        # Same title and DOI, so it is a match rather than litter: the sweep
+        # must leave matches entirely alone.
+        twin = self.make_item(
+            title="Live Harness Canonical Work Two",
+            date="2026",
+            DOI="10.5555/live-harness-keep",
+        )
+
+        result = adopt_connector_pdf(parent, [twin])
+
+        self.assertNotEqual(result.get("route"), "provider-landing-page")
+        live = {item.key for item in DesktopBridgeBackend().snapshot_library()}
+        self.assertIn(parent, live)
+
+
 class RecoveryTests(unittest.TestCase):
     """Interrupted-run recovery, on the real checkpoint and lock mechanisms."""
 

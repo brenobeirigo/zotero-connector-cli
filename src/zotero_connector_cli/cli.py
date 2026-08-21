@@ -1831,6 +1831,17 @@ def _run_save(args: argparse.Namespace, open_url: bool) -> int:
             "and its snapshots were moved to Zotero Trash.",
             file=sys.stderr,
         )
+    elif result.get("adoption", {}).get("route") == "provider-landing-page":
+        adoption = result["adoption"]
+        pages = adoption.get("landingPagesTrashed", [])
+        print(
+            f"The Connector saved the provider's page rather than a PDF for "
+            f"canonical item {adoption['parentKey']}; {len(pages)} landing-page "
+            "item(s) were moved to Zotero Trash.",
+            file=sys.stderr,
+        )
+        for page in pages:
+            print(f"- {page['key']} {page.get('title', '')!r}", file=sys.stderr)
     else:
         print(
             "No Zotero changes detected. Confirm that the target browser has the "

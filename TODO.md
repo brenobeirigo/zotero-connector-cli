@@ -17,12 +17,12 @@ general use. Implemented behavior belongs in `README.md` and `AGENTS.md`.
   retrieval, comparable to the existing `import-bib` dry run.
 - Add fault-injection tests for failures between Connector save, Zotero bridge
   reconciliation, CSV checkpointing, sync, and temporary-window cleanup.
-- Stop saving database landing pages as items. A run against EBSCO on
-  2026-08-03 left six `webpage` items titled "EBSCO" in a project collection.
-  They are retrieval artifacts, not works: they carry no author, no year and
-  no DOI, so nothing downstream can identify them and `merge-duplicates`
-  cannot group them either. Recognise the interstitial page and refuse to save
-  it, rather than leaving it for a person to find later.
+- Clean up after a Connector save that Zotero never reported. The landing-page
+  sweep only runs when adoption runs, and adoption is skipped entirely on the
+  `connector-no-changes` route -- if the save is not observed inside the
+  timeout, whatever it created is still left behind. This is the remaining
+  half of the 2026-08-03 EBSCO artifact problem and it needs a post-run audit,
+  not a longer wait.
 - Add a recovery command that audits stale staging files, incomplete reports,
   temporary Zotero duplicates, and interrupted CSV checkpoints without making
   changes unless explicitly requested.

@@ -320,8 +320,64 @@ for (const key of candidateKeys) {{
     matches.push({{candidate, pdfs, doiMatch, titleMatch}});
 }}
 
-if (matches.length === 0 && regularCandidates.length === 1) {{
-    const mismatch = regularCandidates[0];
+// A saved provider landing page is not a bibliographic record. It carries no
+// PDF, and its only child is an HTML snapshot of the very page the PDF was
+// supposed to be on -- an EBSCO viewer shell, typically, saved because the
+// document never rendered.
+//
+// The cleanup below only ever looked at a *single* candidate, so a run that
+// produced none or several left its litter in the library. Six webpage items
+// titled "EBSCO", all snapshots of one viewer URL, survived a 2026-08-03 run
+// that way and had to be found by hand weeks later. This sweep is therefore
+// deliberately independent of how many candidates there were.
+const landingPagesTrashed = [];
+const unmatchedWithPDFs = [];
+for (const candidate of regularCandidates) {{
+    if (matches.some(match => match.candidate.id === candidate.id)) continue;
+    const children = candidate.getAttachments().map(id => Zotero.Items.get(id));
+    if (children.some(child => child.isPDFAttachment() && !child.deleted)) {{
+        unmatchedWithPDFs.push(candidate);
+        continue;
+    }}
+    // Annotated work is never discarded automatically, even on a snapshot.
+    if (children.some(child => child.isFileAttachment() && child.getAnnotations().length)) {{
+        unmatchedWithPDFs.push(candidate);
+        continue;
+    }}
+    await Zotero.DB.executeTransaction(async () => {{
+        candidate.deleted = true;
+        await candidate.save();
+    }});
+    landingPagesTrashed.push({{
+        key: candidate.key,
+        title: candidate.getField("title"),
+        url: candidate.getField("url"),
+        itemType: Zotero.ItemTypes.getName(candidate.itemTypeID),
+        childContentTypes: children.map(child => child.attachmentContentType || "")
+    }});
+}}
+
+if (matches.length === 0 && unmatchedWithPDFs.length === 0 && landingPagesTrashed.length) {{
+    const refreshedParent = Zotero.Items.getByLibraryAndKey(parent.libraryID, parent.key);
+    const finalCollectionIDs = [...refreshedParent.getCollections()].sort((a, b) => a - b);
+    if (JSON.stringify(originalCollectionIDs) !== JSON.stringify(finalCollectionIDs)) {{
+        throw new Error("Canonical parent collection memberships changed unexpectedly");
+    }}
+    return {{
+        ok: false,
+        route: "provider-landing-page",
+        parentKey: refreshedParent.key,
+        landingPagesTrashed,
+        collectionMembershipsPreserved: true,
+        collections: finalCollectionIDs.map(id => {{
+            const collection = Zotero.Collections.get(id);
+            return {{key: collection.key, name: collection.name}};
+        }})
+    }};
+}}
+
+if (matches.length === 0 && unmatchedWithPDFs.length === 1) {{
+    const mismatch = unmatchedWithPDFs[0];
     if (mismatch && !mismatch.deleted && mismatch.isRegularItem() && mismatch.id !== parent.id) {{
         await Zotero.DB.executeTransaction(async () => {{
             mismatch.deleted = true;
@@ -352,6 +408,7 @@ if (matches.length === 0 && regularCandidates.length === 1) {{
             ok: false,
             route: "connector-mismatch",
             parentKey: refreshedParent.key,
+            landingPagesTrashed,
             duplicateKey: refreshedMismatch.key,
             duplicateTrashed: refreshedMismatch.deleted,
             collections,
@@ -372,6 +429,7 @@ if (currentPDFs.length) {{
             ok: true,
             route: "already-present",
             parentKey: parent.key,
+            landingPagesTrashed,
             attachmentKeys: currentPDFs.map(attachment => attachment.key)
         }};
     }}
