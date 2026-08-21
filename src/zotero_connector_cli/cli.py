@@ -23,6 +23,14 @@ from zotero_core.identity import normalize_doi, normalize_title
 from . import __version__
 from .bib_import import import_bib_directory
 from .ebsco import activate_pdf_access, build_ebsco_search_url
+from .merge_duplicates import (
+    MERGE,
+    apply_duplicates_plan,
+    load_plan,
+    save_plan,
+    scan_duplicates,
+    summarize,
+)
 from .privileged import (
     ZoteroBridgeError,
     adopt_connector_pdf,
@@ -403,6 +411,67 @@ def command_import_bib(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0 if result["ok"] else 5
+
+
+#: How many duplicate groups the human-readable listing prints in full. The
+#: rest are counted out loud rather than dropped silently -- a repair report
+#: that looks complete but is not is worse than a long one.
+_LISTED_GROUPS = 20
+
+
+def _print_groups(plan) -> None:
+    for group in plan.groups[:_LISTED_GROUPS]:
+        master = f" -> keep {group.master_key}" if group.action == MERGE else ""
+        title = group.title or "(untitled)"
+        print(f"  [{group.action}] x{len(group.items)} {title[:70]}{master}")
+        print(f"      {group.reason}: {', '.join(group.keys)}")
+    remaining = len(plan.groups) - _LISTED_GROUPS
+    if remaining > 0:
+        print(f"  ... {remaining} more group(s) not listed; use --plan-out to see them all.")
+
+
+def command_merge_duplicates(args: argparse.Namespace) -> int:
+    ping()
+
+    if args.from_plan:
+        plan = load_plan(args.from_plan)
+    else:
+        plan = scan_duplicates()
+
+    if args.plan_out:
+        destination = save_plan(plan, args.plan_out)
+        if not args.json:
+            print(f"Plan written to {destination}. Edit it, then re-run with --from-plan.")
+
+    if args.apply:
+        plan = apply_duplicates_plan(plan)
+
+    result = summarize(plan)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    counts = result["counts"]
+    mode = "Merged" if result["applied"] else "Dry run"
+    print(
+        f"{mode}: {result['groups']} duplicate group(s) across "
+        f"{result['librarySize']} items; {counts['merge']} to merge, "
+        f"{counts['trash']} to trash, {counts['review']} needing review, "
+        f"{counts['skip']} skipped."
+    )
+    print(
+        f"{result['itemsRemoved']} item(s) "
+        f"{'were' if result['applied'] else 'would be'} folded away."
+    )
+    if not result["applied"]:
+        print("Nothing was written. Re-run with --apply once the plan looks right.")
+    if counts["review"]:
+        print(
+            f"{counts['review']} group(s) matched only on title and were left "
+            "alone; set their action to merge or trash in a plan file to repair them."
+        )
+    _print_groups(plan)
+    return 0
 
 
 def _identity_tokens(value: str) -> list[str]:
@@ -1841,6 +1910,26 @@ def build_parser() -> argparse.ArgumentParser:
     import_bib.add_argument("--json", action="store_true", help="emit JSON")
     import_bib.set_defaults(func=command_import_bib)
 
+    merge_duplicates = subparsers.add_parser(
+        "merge-duplicates",
+        help="find works the library holds more than once and fold them back into one",
+    )
+    merge_duplicates.add_argument(
+        "--plan-out",
+        help="write the plan to this JSON file so it can be reviewed and edited",
+    )
+    merge_duplicates.add_argument(
+        "--from-plan",
+        help="use an edited plan file instead of scanning the library again",
+    )
+    merge_duplicates.add_argument(
+        "--apply",
+        action="store_true",
+        help="carry out the plan (default is a dry run that writes nothing)",
+    )
+    merge_duplicates.add_argument("--json", action="store_true", help="emit JSON")
+    merge_duplicates.set_defaults(func=command_merge_duplicates)
+
     batch_csv = subparsers.add_parser(
         "batch-csv",
         help="process Zotero parent keys and access URLs from a CSV without a model",
@@ -1966,7 +2055,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (RuntimeError, ZoteroUnavailable, ZoteroBridgeError) as exc:
+    # ValueError is how a plan reports that it refuses to be applied. That is
+    # a message for whoever edited the plan, not a stack trace.
+    except (RuntimeError, ValueError, ZoteroUnavailable, ZoteroBridgeError) as exc:
         if getattr(args, "json", False):
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         else:

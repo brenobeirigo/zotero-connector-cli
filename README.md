@@ -116,6 +116,29 @@ preserved and reported instead of giving it two project-stream memberships.
 The command uses the local Zotero CLI Bridge and therefore needs neither a
 model nor `ZOTERO_API_KEY`.
 
+Repair works the library already holds more than once:
+
+```powershell
+zotero-connector merge-duplicates --plan-out "C:\path\to\dedup-plan.json"
+
+zotero-connector merge-duplicates --from-plan "C:\path\to\dedup-plan.json" --apply
+```
+
+The first command writes a plan and changes nothing. Groups sharing a DOI or a
+citation key are proposed for merging; groups that agree only on title and
+year are left as `review`, because two papers can share a title and an erratum
+shares one with the article it corrects. Edit the plan to set a group's action
+to `merge`, `trash`, or `skip`, and to choose which copy survives. By default
+the survivor is whichever copy would be missed most: its citation key first,
+then its DOI, then how many collections it sits in.
+
+Applying a merge moves every attachment and note onto the surviving item
+before folding the duplicates away, and gives it the union of their
+collections. Zotero's own merge does not reliably reparent child items, so the
+command does that itself and then refuses to finish if any attachment is still
+left on a duplicate. Merged-away items go to Zotero's trash, so the operation
+is reversible until the trash is emptied.
+
 Run an entire project status CSV locally, with no model or API service:
 
 ```powershell

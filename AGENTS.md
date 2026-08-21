@@ -165,6 +165,30 @@ Ambiguous global matches fail closed. New records are created only when no
 global match exists, all changes run in one Zotero database transaction, and
 Zotero sync runs once at the end.
 
+## Repairing duplicates that already exist
+
+`import-bib` refuses to create duplicates; `merge-duplicates` repairs the ones
+an earlier tool already created. It also uses the write-capable local CLI
+Bridge.
+
+```powershell
+zotero-connector merge-duplicates --plan-out "<plan.json>"
+zotero-connector merge-duplicates --from-plan "<plan.json>" --apply
+```
+
+Never run `--apply` on an unread plan. The default plan merges only groups
+that share a DOI or a citation key; a title-and-year group is reported as
+`review` and is never merged on the tool's own authority. Do not promote a
+`review` group to `merge` without checking the items — that is the decision
+this workflow exists to put in front of a person.
+
+Two limits are deliberate and must be stated rather than worked around. Items
+with no year are not grouped by title alone, so retrieval artifacts that share
+a generic title do not appear as duplicates; trash those by adding an explicit
+group to the plan. And a merge across item types is refused outright rather
+than resolved, because folding a book into a conference paper silently drops
+fields.
+
 ## Resume, reports, and exit codes
 
 The runner writes these files beside the source CSV by default:

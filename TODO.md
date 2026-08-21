@@ -26,6 +26,18 @@ general use. Implemented behavior belongs in `README.md` and `AGENTS.md`.
   retrieval, comparable to the existing `import-bib` dry run.
 - Add fault-injection tests for failures between Connector save, Zotero bridge
   reconciliation, CSV checkpointing, sync, and temporary-window cleanup.
+- Stop saving database landing pages as items. A run against EBSCO on
+  2026-08-03 left six `webpage` items titled "EBSCO" in a project collection.
+  They are retrieval artifacts, not works: they carry no author, no year and
+  no DOI, so nothing downstream can identify them and `merge-duplicates`
+  cannot group them either. Recognise the interstitial page and refuse to save
+  it, rather than leaving it for a person to find later.
+- Give `merge-duplicates` a live Zotero test. Its bridge script is the only
+  write path with no automated coverage, and the first real run revealed that
+  `Zotero.Items.merge` does not reparent child items on Zotero 9.0.6 -- the
+  attachments followed the losing items into the trash. The script now moves
+  children itself and fails closed if any are left behind, but that behavior
+  is asserted only by hand.
 - Add a recovery command that audits stale staging files, incomplete reports,
   temporary Zotero duplicates, and interrupted CSV checkpoints without making
   changes unless explicitly requested.
