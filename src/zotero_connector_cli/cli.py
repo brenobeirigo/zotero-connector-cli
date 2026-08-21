@@ -22,7 +22,8 @@ from zotero_core.identity import normalize_doi, normalize_title
 
 from . import __version__
 from .bib_import import import_bib_directory
-from .ebsco import activate_pdf_access, build_ebsco_search_url
+from .ebsco import activate_pdf_access, build_search_url
+from .providers import load_providers, resolve_provider
 from .merge_duplicates import (
     MERGE,
     apply_duplicates_plan,
@@ -35,6 +36,7 @@ from .privileged import (
     ZoteroBridgeError,
     adopt_connector_pdf,
     attach_pdf_file,
+    bridge_info,
     bridge_ping,
     find_available_pdf,
     parent_info,
@@ -297,10 +299,20 @@ def command_doctor(args: argparse.Namespace) -> int:
     except ZoteroUnavailable as exc:
         result["zotero"]["message"] = str(exc)
     try:
-        bridge = bridge_ping()
+        # Ask the plugin about itself rather than concluding "the bridge is
+        # fine" from the endpoint answering. A stale bridge answers exactly
+        # like a current one until the first call that needs what it lacks.
+        info = bridge_info()
+        version = info["bridgeVersion"] or "unknown version"
         result["cliBridge"] = {
             "reachable": True,
-            "message": f"Zotero {bridge['version']}",
+            "message": f"Zotero {info['zoteroVersion']}, plugin {version}",
+            "supported": info["ok"],
+            "problems": info["problems"],
+            "addonID": info["addonID"],
+            "bridgeVersion": info["bridgeVersion"],
+            "package": info["package"],
+            "homepage": info["homepage"],
         }
     except (ZoteroUnavailable, ZoteroBridgeError) as exc:
         result["cliBridge"]["message"] = str(exc)
@@ -327,6 +339,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         print(f"Zotero: {status} — {result['zotero']['message']}")
         bridge_status = "available" if result["cliBridge"]["reachable"] else "unavailable"
         print(f"Bridge: {bridge_status} — {result['cliBridge']['message']}")
+        for problem in result["cliBridge"].get("problems", []):
+            print(f"        ! {problem}")
         for browser, executable in result["browsers"].items():
             print(f"{browser:7}: {executable or 'not found'}")
         for window in result["visibleBrowserWindows"]:
@@ -1560,7 +1574,10 @@ def _execute_ebsco_pdf(
         }
 
     browser = _choose_browser(args.browser)
-    search_url = build_ebsco_search_url(title)
+    provider = resolve_provider(
+        getattr(args, "provider", None), getattr(args, "provider_config", None)
+    )
+    search_url = build_search_url(provider, title)
     before = state()
     temporary_window = None
     close_error = None
@@ -1592,6 +1609,7 @@ def _execute_ebsco_pdf(
                 title=title,
                 max_tabs=args.ebsco_max_tabs,
                 tab_wait=args.ebsco_tab_wait,
+                provider=provider,
             )
             if not access:
                 result = {
@@ -1648,10 +1666,37 @@ def _execute_ebsco_pdf(
 
     result["browserWindowClosed"] = not close_error
     result["cleanupOk"] = not close_error
+    # Which institution's route ran. Recorded on every outcome, because a
+    # report saying "no PDF access" means something different depending on
+    # whose subscription was searched.
+    result.setdefault("provider", provider.name)
     if close_error:
         result["tabCloseError"] = close_error
         return 8, result
     return exit_code, result
+
+
+def command_providers(args: argparse.Namespace) -> int:
+    providers, declared = load_providers(args.provider_config)
+    active = resolve_provider(args.provider, args.provider_config)
+    payload = {
+        "default": active.name,
+        "declaredDefault": declared,
+        "providers": [providers[name].to_dict() for name in sorted(providers)],
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    for name in sorted(providers):
+        marker = "*" if name == active.name else " "
+        provider = providers[name]
+        print(f"{marker} {name}")
+        print(f"    {provider.search_base}")
+        if provider.description:
+            print(f"    {provider.description}")
+    print()
+    print("* is the provider that would run. Override it with --provider.")
+    return 0
 
 
 def _execute_save(args: argparse.Namespace, open_url: bool) -> tuple[int, dict]:
@@ -1930,6 +1975,15 @@ def build_parser() -> argparse.ArgumentParser:
     merge_duplicates.add_argument("--json", action="store_true", help="emit JSON")
     merge_duplicates.set_defaults(func=command_merge_duplicates)
 
+    providers = subparsers.add_parser(
+        "providers",
+        help="list the institutional providers available for the PDF fallback",
+    )
+    providers.add_argument("--provider", help="report this provider as the active one")
+    providers.add_argument("--provider-config", help="JSON file defining providers")
+    providers.add_argument("--json", action="store_true", help="emit JSON")
+    providers.set_defaults(func=command_providers)
+
     batch_csv = subparsers.add_parser(
         "batch-csv",
         help="process Zotero parent keys and access URLs from a CSV without a model",
@@ -1964,7 +2018,22 @@ def build_parser() -> argparse.ArgumentParser:
     batch_csv.add_argument(
         "--skip-ebsco",
         action="store_true",
-        help="disable the automatic University of Twente EBSCO PDF fallback",
+        help="disable the automatic institutional-provider PDF fallback",
+    )
+    batch_csv.add_argument(
+        "--provider",
+        help=(
+            "institutional provider for the PDF fallback (default: the "
+            "provider file's own default, then ZOTERO_CONNECTOR_PROVIDER, "
+            "then the built-in utwente-ebsco route)"
+        ),
+    )
+    batch_csv.add_argument(
+        "--provider-config",
+        help=(
+            "JSON file defining providers (default: ZOTERO_CONNECTOR_PROVIDERS, "
+            "then ~/.config/zotero-connector/providers.json)"
+        ),
     )
     batch_csv.add_argument(
         "--ebsco-load-wait",

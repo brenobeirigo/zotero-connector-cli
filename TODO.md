@@ -5,15 +5,6 @@ general use. Implemented behavior belongs in `README.md` and `AGENTS.md`.
 
 ## Release blockers
 
-- Package and document the companion Zotero CLI Bridge used by write-capable
-  commands, including installation, compatibility, local-only access controls,
-  and an upgrade path. The public Python package is not turnkey without it.
-- Replace the hard-coded University of Twente EBSCO route with a configurable
-  institutional-provider interface. Preserve the existing UT route as one
-  tested configuration rather than the universal default.
-- Add a live Windows integration-test profile covering Zotero Desktop, the CLI
-  Bridge, a browser with Zotero Connector, temporary-item cleanup, collection
-  preservation, and interrupted-run recovery.
 - Define a versioning and release process: changelog, tagged GitHub releases,
   built wheel/sdist, dependency audit, and optional PyPI publication.
 
@@ -32,12 +23,6 @@ general use. Implemented behavior belongs in `README.md` and `AGENTS.md`.
   no DOI, so nothing downstream can identify them and `merge-duplicates`
   cannot group them either. Recognise the interstitial page and refuse to save
   it, rather than leaving it for a person to find later.
-- Give `merge-duplicates` a live Zotero test. Its bridge script is the only
-  write path with no automated coverage, and the first real run revealed that
-  `Zotero.Items.merge` does not reparent child items on Zotero 9.0.6 -- the
-  attachments followed the losing items into the trash. The script now moves
-  children itself and fails closed if any are left behind, but that behavior
-  is asserted only by hand.
 - Add a recovery command that audits stale staging files, incomplete reports,
   temporary Zotero duplicates, and interrupted CSV checkpoints without making
   changes unless explicitly requested.
@@ -58,8 +43,10 @@ general use. Implemented behavior belongs in `README.md` and `AGENTS.md`.
 
 ## Retrieval extensions
 
-- Add configurable OpenURL/library-resolver routes and institution-specific
-  adapters without embedding credentials or browser state.
+- Add OpenURL/library-resolver routes to the provider interface. `providers.py`
+  now covers EBSCO-shaped search pages for any institution; a provider whose
+  route is an OpenURL resolver rather than a search URL still has nowhere to
+  describe itself. Credentials and browser state stay out of provider files.
 - Consider Unpaywall and repository lookup as transparent, lawful discovery
   routes when Zotero's native PDF finder returns no result.
 - Generalize browser invocation beyond a fixed keyboard shortcut, preferably

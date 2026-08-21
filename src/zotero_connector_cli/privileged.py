@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from zotero_core.backends.desktop import bridge_ping, evaluate
+from zotero_core.backends.desktop import bridge_info, bridge_ping, evaluate
 from zotero_core.errors import BridgeError, BridgeNotInstalled, ZoteroUnavailable
 
 # The bridge transport, its ping, and the error taxonomy are shared with every
@@ -16,6 +16,7 @@ __all__ = [
     "ZoteroUnavailable",
     "adopt_connector_pdf",
     "attach_pdf_file",
+    "bridge_info",
     "bridge_ping",
     "evaluate",
     "find_available_pdf",

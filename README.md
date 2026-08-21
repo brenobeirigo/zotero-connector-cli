@@ -9,11 +9,15 @@ communication with Zotero Desktop.
 The CLI never reads browser cookies, profiles, passwords, or extension storage.
 
 > [!IMPORTANT]
-> This is an experimental Windows tool. Write-capable commands currently
-> require a companion Zotero CLI Bridge that exposes a local-only evaluation
-> endpoint. The bridge is installed in the author's environment but is not yet
-> distributed from this repository. See [TODO.md](TODO.md) before treating the
-> package as a turnkey installation.
+> This is an experimental Windows tool. Write-capable commands require the
+> **Zotero CLI Bridge**, a third-party Zotero plugin that exposes a local-only
+> evaluation endpoint. It is not ours and is not vendored here; install it
+> with `pip install cli-anything-zotero && zotero-cli app install-plugin`.
+> That endpoint evaluates arbitrary privileged JavaScript for any process on
+> your machine — read
+> [zotero-core/docs/cli-bridge.md](https://github.com/brenobeirigo/zotero-core/blob/main/docs/cli-bridge.md)
+> before installing it. `zotero-connector doctor` reports which version is
+> answering and whether it is one this package has been tested against.
 
 Automated agents should follow [AGENTS.md](AGENTS.md), which documents project
 CSV schemas, preconditions, batch/resume commands, exit-code handling, durable
@@ -27,7 +31,7 @@ reports, authentication handoffs, and Zotero safety invariants.
 - Zotero Connector installed in Edge, Brave, Chrome, or Firefox
 - `Ctrl+Shift+S` assigned to the Connector's **Save to Zotero** action
 - Any institutional proxy configured in the Connector
-- Companion Zotero CLI Bridge for commands that modify the library
+- Zotero CLI Bridge plugin, for commands that modify the library
 
 ## Install
 
@@ -43,6 +47,21 @@ BibTeX parsing, item typing, duplicate matching and import planning come from
 shares with the other tools that write to the same library. What lives here is
 the Windows side: browser Connector automation, PDF retrieval and its route
 cascade, and the resumable batch runner.
+
+## Tests
+
+```powershell
+python -m pytest tests            # unit tests; no Zotero, no network
+```
+
+There is also a live profile that drives a real Zotero, the bridge, and a
+browser. It writes to your library, so it is opt-in and skipped by default —
+see [tests/integration/README.md](tests/integration/README.md):
+
+```powershell
+$env:ZOTERO_CONNECTOR_LIVE = "1"
+python -m pytest tests/integration -v
+```
 
 ## Usage
 
@@ -199,15 +218,46 @@ isolated windows are closed before the batch continues, and the final report's
 `interactiveRequired` count tells an agent when the user needs a later login
 handoff.
 
-The standard batch also includes an automatic University of Twente EBSCO
-full-text route. INFORMS items (`10.1287/*` or a Pubsonline access URL) go to
-EBSCO before the publisher page; other clean publisher misses receive EBSCO as
-a fallback. The CLI generates an exact-title EBSCO search, activates only the
-matching `Access now (PDF)` accessibility control, waits for the EBSCO viewer,
-and invokes Zotero Connector there. It uses the signed-in Edge session without
-reading cookies, uses no model or screen coordinates, attaches only to the
-canonical parent, preserves collections, and closes the exact browser window.
-Use `--skip-ebsco` only when diagnosing this route.
+The standard batch also includes an automatic institutional full-text route.
+INFORMS items (`10.1287/*` or a Pubsonline access URL) go to the provider
+before the publisher page; other clean publisher misses receive it as a
+fallback. The CLI generates an exact-title search, activates only the matching
+`Access now (PDF)` accessibility control, waits for the viewer, and invokes
+Zotero Connector there. It uses the signed-in Edge session without reading
+cookies, uses no model or screen coordinates, attaches only to the canonical
+parent, preserves collections, and closes the exact browser window. Use
+`--skip-ebsco` only when diagnosing this route.
+
+Which institution it searches is configuration, not code:
+
+```powershell
+zotero-connector providers                     # what is available, and which one runs
+zotero-connector batch-csv --provider my-uni-ebsco ...
+```
+
+One provider ships built in, `utwente-ebsco`, as a tested reference
+configuration. Add your own in a JSON file — `--provider-config`, else
+`ZOTERO_CONNECTOR_PROVIDERS`, else
+`~/.config/zotero-connector/providers.json`:
+
+```json
+{
+  "providers": {
+    "my-uni-ebsco": {
+      "searchBase": "https://research-ebsco-com.ezproxy.example.edu/c/abcdef/search/advanced-results",
+      "databases": "bth,eric",
+      "accessControlPrefix": "access now pdf",
+      "description": "Example University"
+    }
+  },
+  "default": "my-uni-ebsco"
+}
+```
+
+An entry may reuse a built-in's name to correct it without forking anything.
+`searchBase` must be `https`: an EZproxy route carries a session cookie, and
+plain http would leak it, so it is refused rather than warned about. Provider
+files hold no credentials — authentication is the browser session's business.
 
 For a lawful source that is reachable from another Tailscale machine, add an
 explicit `remote_url` column and enable the serial SSH fallback:

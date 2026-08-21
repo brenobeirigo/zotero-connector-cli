@@ -200,10 +200,18 @@ The standard JSON report declares `executionMode: single-process-serial`.
 Interactive-download mode uses the explicitly documented variant below; treat
 any other value as an incompatible or older runner.
 
-### Automatic EBSCO full-text route
+### Automatic institutional full-text route
 
-The standard batch automatically searches the University of Twente EBSCO
-collection by exact title. For INFORMS records (`10.1287/*` or a
+The route's host, database list and download-control name come from a named
+provider, not from constants in the code. `zotero-connector providers` prints
+which ones exist and which would run; `--provider` selects one and
+`--provider-config` names the file. The built-in `utwente-ebsco` is the tested
+reference configuration and the fallback when nothing else is configured — do
+not treat it as the only route, and do not hard-code an institution's URL
+anywhere. Provider files never hold credentials.
+
+The standard batch searches the active provider's collection by exact title.
+For INFORMS records (`10.1287/*` or a
 `pubsonline.informs.org` access URL), it tries EBSCO before the publisher page;
 for other records it uses EBSCO after a clean publisher/Connector miss. The
 runner opens the generated EBSCO results URL in the authenticated Edge profile,
