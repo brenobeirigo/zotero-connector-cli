@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 .venv/
 tmp/
+.audit/
+audit-requirements.txt
+dist/
+build/
+RELEASE_BODY.md

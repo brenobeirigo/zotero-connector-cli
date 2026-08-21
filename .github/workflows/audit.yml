@@ -1,0 +1,44 @@
+name: audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly. A vulnerability disclosed against a pinned dependency does not
+    # wait for the next commit, so neither does this.
+    - cron: "41 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    # pywinauto is a hard dependency here and does not install on Linux, so
+    # the audit has to resolve the real dependency set on Windows.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install pip-audit
+      # Audit this package's own dependency closure, not the runner's. A CVE
+      # in pip-audit's dependencies is not a reason to block this release, and
+      # installing the tool alongside the package would make it one.
+      - name: Resolve this package's dependencies into a clean environment
+        run: |
+          python -m venv .audit
+          PY=$(ls .audit/bin/python .audit/Scripts/python.exe 2>/dev/null | head -1)
+          "$PY" -m pip install --quiet --upgrade pip
+          "$PY" -m pip install --quiet "zotero-core @ git+https://github.com/brenobeirigo/zotero-core.git@main" .
+          "$PY" -m pip freeze --exclude-editable > audit-requirements.txt
+          cat audit-requirements.txt
+
+      # Advisory here, blocking on a release tag. A finding on the schedule
+      # should start a conversation, not break an unrelated pull request.
+      - run: python -m pip_audit -r audit-requirements.txt || echo "::warning::pip-audit reported findings"
